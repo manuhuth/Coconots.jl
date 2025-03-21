@@ -1,7 +1,7 @@
 name = "Coconots"
 uuid = "2061d889-07fc-48e0-ab41-7cc4d945d6d4"
 authors = ["Manuel Huth", "Robert C. Jung", "Andy Tremayne"]
-version = "1.0.0-DEV"
+version = "1.0.0"
 
 [deps]
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
