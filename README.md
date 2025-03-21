@@ -2,7 +2,7 @@
 
 [![Build Status](https://github.com/manuhuth/Coconots.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/manuhuth/Coconots.jl/actions/workflows/CI.yml?query=branch%3Amain)
 
-The `Coconots` package provides a robust and user-friendly Julia framework for analyzing time series consisting of low counts. It implements practical integer autoregressive (INAR) models capable of capturing both first-order and higher-order dependencies based on the foundational work by Joe (1996). The package supports modeling of both equidispersed and overdispersed marginal distributions and allows for the inclusion of regression effects.
+The `Coconots` package provides a robust and user-friendly Julia framework for analyzing time series consisting of low counts. Likelihood-based methods for model fitting, assessment and prediction analysis of some convolution-closed count time series model are provided. The marginal distribution can be Poisson or Generalized Poisson. Regression effects can be modelled via time varying innovation rates. 
 
 ## Key Features
 
