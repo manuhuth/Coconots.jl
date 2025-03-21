@@ -14,11 +14,12 @@ The `Coconots` package provides a robust and user-friendly Julia framework for a
 
 ## Installation
 
-Install directly via the Julia package manager:
+Install directly via Github:
 
 ```julia
 using Pkg
-Pkg.add("Coconots")
+#Pkg.add("Coconots") #Adding the package from the general repository will be available soon
+Pkg.add(url="https://github.com/manuhuth/Coconots.jl")
 ```
 
 ## Usage Examples
