@@ -10,5 +10,5 @@ module Coconots
     include("LinkFunctions.jl")
     include("Scores.jl")
     include("StartingValues.jl")
-    include("PreCompilation.jl")
+    #include("PreCompilation.jl")
 end
