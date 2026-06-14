@@ -55,3 +55,12 @@ end
     result_last = Coconots.get_lambda(cocoReg_fit, true)
     @test isapprox(result_last, expected_last; atol=1e-8)
 end
+
+@testset "get_link_function softplus" begin
+    f = Coconots.get_link_function("softplus")
+    @test isapprox(f(0.0), log(2.0); atol=1e-10)
+    @test f(-10.0) > 0
+    @test f(10.0) > 0
+    @test isapprox(f(100.0), 100.0; atol=1e-6)
+    @test_throws ErrorException Coconots.get_link_function("unknown")
+end

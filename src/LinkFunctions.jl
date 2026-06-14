@@ -45,6 +45,22 @@ function relu(x::Real)
 end
 
 """
+    softplus(x)
+
+Computes the softplus function: log(1 + exp(x)). Always positive and smooth everywhere,
+making it a differentiable alternative to relu.
+
+# Arguments
+- `x::Real`: Input value.
+
+# Returns
+- `Real`: log(1 + exp(x)).
+"""
+function softplus(x::Real)
+    return x > 0 ? x + log(1 + exp(-x)) : log(1 + exp(x))
+end
+
+"""
     identity_func(x)
 
 Identity function that returns the input unchanged.
@@ -69,6 +85,7 @@ Retrieves the appropriate link function based on the provided string identifier.
     - `"log"`: Exponential function (`exp`).
     - `"identity"`: Identity function.
     - `"relu"`: Rectified Linear Unit (ReLU).
+    - `"softplus"`: Softplus function log(1 + exp(x)), always positive and smooth.
 
 # Returns
 - `Function`: Corresponding link function.
@@ -80,6 +97,8 @@ function get_link_function(link_function::String)
         return identity_func
     elseif link_function == "relu"
         return relu
+    elseif link_function == "softplus"
+        return softplus
     else
         error("Unknown link function")
     end
