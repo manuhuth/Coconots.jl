@@ -34,8 +34,8 @@ and then compares these intervals with the PACF computed from the observed data.
 
 # Returns
 A dictionary with the following keys:
-- `"upper"`: The lower quantile values (first column) of the bootstrapped PACF for each lag.
-- `"lower"`: The upper quantile values (second column) of the bootstrapped PACF for each lag.
+- `"lower"`: The lower quantile values (first column) of the bootstrapped PACF for each lag.
+- `"upper"`: The upper quantile values (second column) of the bootstrapped PACF for each lag.
 - `"in_interval"`: A Boolean vector indicating if the observed PACF values lie within the bootstrap confidence intervals.
 - `"pacf_data"`: The PACF computed from the observed data.
 - `"pacfs"`: The matrix of bootstrapped PACF values.
@@ -44,11 +44,11 @@ A dictionary with the following keys:
 function cocoBoot(cocoReg_fit, lags=[1:1:21;], n_bootstrap=400, alpha=0.05, n_burn_in=200, store_matrix = Array{Float64}(undef, length(lags), 2))
     pacfs = compute_random_pacfs(cocoReg_fit, lags, Int(n_bootstrap), n_burn_in, Array{Float64}(undef, Int(n_bootstrap), length(lags)))
     for i in 1:length(lags)
-        store_matrix[i, :] = quantile!(pacfs[:, i], [alpha/2, (1 - alpha)/2])
+        store_matrix[i, :] = quantile!(pacfs[:, i], [alpha/2, 1 - alpha/2])
     end
     pacf_data = compute_partial_autocorrelation(Int.(cocoReg_fit["data"]), lags)
-    return Dict("upper" => store_matrix[:, 1],
-                "lower" => store_matrix[:, 2],
+    return Dict("lower" => store_matrix[:, 1],
+                "upper" => store_matrix[:, 2],
                 "in_interval" => (store_matrix[:, 1] .< pacf_data) .& (store_matrix[:, 2] .> pacf_data),
                 "pacf_data" => pacf_data,
                 "pacfs" => pacfs,
