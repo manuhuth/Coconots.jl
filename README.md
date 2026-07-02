@@ -85,6 +85,13 @@ fit = cocoReg(type, order, data; box_constrained = true)  # Fminbox(LBFGS())
 # fit = cocoReg(type, order, data; adtype = AutoEnzyme())
 ```
 
+The likelihood evaluations are multithreaded, but a Julia process starts
+single-threaded by default: launch with `julia --threads=8` (or set
+`JULIA_NUM_THREADS`) to activate the parallel paths. Second-order fits on
+long or overdispersed series gain roughly 3x on 8 threads; when calling from
+R via JuliaConnectoR, set `Sys.setenv(JULIA_NUM_THREADS = "8")` before the
+first Julia call of the session.
+
 ### Model Diagnostics
 
 Perform residual diagnostics and bootstrap:
