@@ -53,7 +53,7 @@ function convolution_pmf_vector(xmax::Integer, y::Integer, lambda::Real, alpha::
     pmf = Vector{T}(undef, xmax + 1)
     @inbounds for x in 0:xmax
         total = zero(T)
-        for r in 0:min(x, rmax)
+        @simd for r in 0:min(x, rmax)
             total += g[r + 1] * innovation[x - r + 1]
         end
         pmf[x + 1] = total
@@ -181,7 +181,7 @@ function convolution_pmf_vector(kernel::GP2Kernel{T}, xmax::Integer, y::Integer,
     pmf = Vector{T}(undef, xmax + 1)
     @inbounds for x in 0:xmax
         total = zero(T)
-        for r in 0:min(x, rmax)
+        @simd for r in 0:min(x, rmax)
             total += g[r + 1] * kernel.gp_lambda[x - r + 1]
         end
         pmf[x + 1] = total
@@ -243,19 +243,21 @@ end
 # Negative log-likelihoods
 #--------------------------------------------------------------------------------------
 
-function _transition_counts(data::AbstractVector, order::Integer)
-    if Int(order) == 1
-        counts = Dict{NTuple{2, Int}, Int}()
-        for t in 2:length(data)
-            key = (Int(data[t]), Int(data[t - 1]))
-            counts[key] = get(counts, key, 0) + 1
-        end
-    else
-        counts = Dict{NTuple{3, Int}, Int}()
-        for t in 3:length(data)
-            key = (Int(data[t]), Int(data[t - 1]), Int(data[t - 2]))
-            counts[key] = get(counts, key, 0) + 1
-        end
+function _transition_pair_counts(data::AbstractVector)
+    counts = Dict{NTuple{2, Int}, Int}()
+    for t in 2:length(data)
+        key = (Int(data[t]), Int(data[t - 1]))
+        counts[key] = get(counts, key, 0) + 1
+    end
+    transitions = sort!(collect(keys(counts)))
+    return transitions, Int[counts[k] for k in transitions]
+end
+
+function _transition_triple_counts(data::AbstractVector)
+    counts = Dict{NTuple{3, Int}, Int}()
+    for t in 3:length(data)
+        key = (Int(data[t]), Int(data[t - 1]), Int(data[t - 2]))
+        counts[key] = get(counts, key, 0) + 1
     end
     transitions = sort!(collect(keys(counts)))
     return transitions, Int[counts[k] for k in transitions]
@@ -281,23 +283,76 @@ function _nll_gp1_transitions(lambda::Real, alpha::Real, eta::Real,
     return total
 end
 
+"""
+    _GP2TransitionGroup
+
+Unique transitions of one `(y, z)` history: the observed next counts `xs`
+with multiplicities `counts`, and the largest convolution index `rmax`
+any of them needs. Grouping lets one `g(r | y, z)` vector (and one bivariate
+normalizer) serve every `x` that shares the history.
+"""
+struct _GP2TransitionGroup
+    y::Int
+    z::Int
+    rmax::Int
+    xs::Vector{Int}
+    counts::Vector{Int}
+end
+
+function _group_transitions(transitions::Vector{NTuple{3, Int}}, counts::Vector{Int})
+    order = sortperm(transitions; by = t -> (t[2], t[3], t[1]))
+    groups = Vector{_GP2TransitionGroup}()
+    for i in order
+        x, y, z = transitions[i]
+        rmax = min(x, y + z)
+        if isempty(groups) || last(groups).y != y || last(groups).z != z
+            push!(groups, _GP2TransitionGroup(y, z, rmax, [x], [counts[i]]))
+        else
+            group = last(groups)
+            push!(group.xs, x)
+            push!(group.counts, counts[i])
+            groups[end] = _GP2TransitionGroup(y, z, max(group.rmax, rmax), group.xs,
+                group.counts)
+        end
+    end
+    return groups
+end
+
+function _nll_gp2_group(kernel::GP2Kernel{T}, group::_GP2TransitionGroup, max_loop,
+        g_buffer::Vector{T} = Vector{T}(undef, group.rmax + 1)) where {T}
+    smax = max_loop === nothing ? group.y : Int(max_loop)
+    normalizer = bivariate_generalized_poisson(group.y, group.z, kernel.lambda,
+        kernel.alpha1, kernel.alpha2, kernel.alpha3, kernel.eta)
+    @inbounds for r in 0:(group.rmax)
+        g_buffer[r + 1] = compute_g_r_y_z(kernel, r, group.y, group.z, normalizer,
+            smax)
+    end
+    total = zero(T)
+    @inbounds for (x, count) in zip(group.xs, group.counts)
+        convolution = zero(T)
+        for r in 0:min(x, group.rmax)
+            convolution += g_buffer[r + 1] * kernel.gp_lambda[x - r + 1]
+        end
+        total -= count * log(convolution)
+    end
+    return total
+end
+
 function _nll_gp2_transitions(lambda::Real, alpha1::Real, alpha2::Real, alpha3::Real,
-        eta::Real, transitions::Vector{NTuple{3, Int}}, counts::Vector{Int},
-        max_index::Integer, max_loop)
+        eta::Real, groups::Vector{_GP2TransitionGroup}, max_index::Integer, max_loop)
     kernel = GP2Kernel(lambda, alpha1, alpha2, alpha3, eta, max_index)
     T = eltype(kernel.gp_lambda)
-    if nthreads() > 1 && length(transitions) > 32
-        parts = Vector{T}(undef, length(transitions))
-        @threads for i in eachindex(transitions)
-            x, y, z = transitions[i]
-            parts[i] = -counts[i] * log(convolution_x_r_y_z(kernel, x, y, z, max_loop))
+    if nthreads() > 1 && length(groups) > 16
+        parts = Vector{T}(undef, length(groups))
+        @threads for i in eachindex(groups)
+            parts[i] = _nll_gp2_group(kernel, groups[i], max_loop)
         end
         return sum(parts)
     end
     total = zero(T)
-    for i in eachindex(transitions)
-        x, y, z = transitions[i]
-        total -= counts[i] * log(convolution_x_r_y_z(kernel, x, y, z, max_loop))
+    g_buffer = Vector{T}(undef, maximum(group -> group.rmax, groups) + 1)
+    for group in groups
+        total += _nll_gp2_group(kernel, group, max_loop, g_buffer)
     end
     return total
 end
@@ -316,7 +371,7 @@ exactly once.
 """
 function compute_negative_log_likelihood_GP1(lambda::Real, alpha::Real, eta::Real,
         data::AbstractVector)
-    transitions, counts = _transition_counts(data, 1)
+    transitions, counts = _transition_pair_counts(data)
     return _nll_gp1_transitions(lambda, alpha, eta, transitions, counts)
 end
 
@@ -364,9 +419,9 @@ rate `lambda`. Builds one [`GP2Kernel`](@ref) and aggregates over the unique
 """
 function compute_negative_log_likelihood_GP2(lambda::Real, alpha1::Real, alpha2::Real,
         alpha3::Real, eta::Real, data::AbstractVector, max_loop = nothing)
-    transitions, counts = _transition_counts(data, 2)
-    return _nll_gp2_transitions(lambda, alpha1, alpha2, alpha3, eta, transitions,
-        counts, _gp2_max_index(transitions), max_loop)
+    transitions, counts = _transition_triple_counts(data)
+    return _nll_gp2_transitions(lambda, alpha1, alpha2, alpha3, eta,
+        _group_transitions(transitions, counts), _gp2_max_index(transitions), max_loop)
 end
 
 """

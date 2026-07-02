@@ -3,6 +3,17 @@ using Test
 using Random
 using ForwardDiff
 using Statistics: mean
+using Aqua
+using JET
+
+@testset "Aqua" begin
+    Aqua.test_all(Coconots; ambiguities = false)
+    Aqua.test_ambiguities(Coconots)
+end
+
+@testset "JET" begin
+    JET.test_package(Coconots; target_defined_modules = true)
+end
 
 @testset "convolution distributions (order 1)" begin
     y = 10

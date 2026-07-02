@@ -30,8 +30,8 @@ function _make_objective(type, order, data::Vector{Int}, covariates, link_functi
         max_loop, reparameterized::Bool)
     is_gp = type == "GP"
     if covariates === nothing
-        transitions, counts = _transition_counts(data, order)
         if Int(order) == 1
+            transitions, counts = _transition_pair_counts(data)
             if is_gp
                 return theta -> _nll_gp1_transitions(theta[3], theta[1], theta[2],
                     transitions, counts)
@@ -39,14 +39,16 @@ function _make_objective(type, order, data::Vector{Int}, covariates, link_functi
             return theta -> _nll_gp1_transitions(theta[2], theta[1],
                 zero(eltype(theta)), transitions, counts)
         end
+        transitions, counts = _transition_triple_counts(data)
         max_index = _gp2_max_index(transitions)
+        groups = _group_transitions(transitions, counts)
         lambda_index = is_gp ? 5 : 4
         return function (theta)
             alpha1, alpha2, alpha3 = reparameterized ? reparameterize_alpha(theta) :
                                      (theta[1], theta[2], theta[3])
             eta = is_gp ? theta[4] : zero(eltype(theta))
             return _nll_gp2_transitions(theta[lambda_index], alpha1, alpha2, alpha3,
-                eta, transitions, counts, max_index, max_loop)
+                eta, groups, max_index, max_loop)
         end
     end
     link = get_link_function(link_function)
