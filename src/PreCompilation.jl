@@ -1,72 +1,24 @@
-using Random, PrecompileTools
-using Base.Iterators: product
-
+using PrecompileTools: @compile_workload
 
 @compile_workload begin
-    types = ["Poisson", "GP"]
-    orders = [1, 2]
-    links = ["identity", "log", "relu"]
-    covariates = [false, true]
-    lambdas = [0.7]
-    n = 40
+    Random.seed!(1)
+    let
+        data1 = cocoSim("Poisson", 1, [0.3, 1.0], 60, nothing, "log", 20)
+        fit1 = cocoReg("Poisson", 1, data1)
+        compute_scores(fit1, 10)
+        cocoPit(fit1, 5)
+        cocoBoot(fit1, [1:1:5;], 4)
+        cocoPredictOneStep(fit1, 0:5)
+        cocoPredictKsteps(fit1, 2, 10)
 
-    #------------------------------------------No Covariates-----------------------------------------------------------------------
-    parameter_1 = [0.3]
-    parameter_2 = [0.3, 0.05, 0.2]
+        data2 = cocoSim("GP", 2, [0.25, 0.05, 0.1, 0.1, 1.0], 60, nothing, "log", 20)
+        fit2 = cocoReg("GP", 2, data2)
+        compute_scores(fit2, 10)
+        cocoPit(fit2, 5)
+        cocoPredictOneStep(fit2, 0:5)
 
-    k = n
-
-    cov_x = reshape(sin.(1:k) .+ 4.2, :, 1)
-    cov_x_p1 = reshape(sin.((k+1):(k+3)) .+ 4.2, :, 1)
-
-    pars = []
-
-    Random.seed!(3)
-
-    for (type, order, link, covs, lambda) in product(types, orders, links, covariates, lambdas)
-
-        if order == 1
-            pars = copy(parameter_1)
-        elseif order == 2
-            pars = copy(parameter_2)
-        end
-
-        append!(pars, lambda)
-
-        if type == "GP"
-            insert!(pars, length(pars), 0.2)
-        end
-
-        if covs
-            pars[end] = lambda
-            cov_sim = copy(cov_x)
-            cov_reg = copy(cov_x)
-            cov_pred = copy(cov_x[1:1, :])
-        else
-            cov_sim = nothing
-            cov_reg = nothing
-            cov_pred = nothing
-        end
-
-        if link == "log"
-            cov_sim = log.(copy(cov_x))
-            cov_reg = log.(copy(cov_x))
-            cov_pred = log.(copy(cov_x[1:1, :]))
-        end
-
-        data = cocoSim(type, order, pars, n, cov_sim,
-                            link, 50)
-
-        fit = cocoReg(type, order, data, cov_reg)
-
-        cocoBoot(fit, [1:1:21;], 10)
-
-        cocoPit(fit)
-
-        compute_scores(fit)
-
-        cocoPredictOneStep(fit, 0:Int(ceil(maximum(data) * 1.5)), cov_pred)
-
-        cocoPredictKsteps(fit, 1, 50, cov_pred)
+        covariates = hcat(ones(60), sin.((1:60) ./ 6))
+        data3 = cocoSim("GP", 1, [0.3, 0.1, 0.5, 0.2], 60, covariates, "log", 0)
+        cocoReg("GP", 1, data3, covariates)
     end
 end

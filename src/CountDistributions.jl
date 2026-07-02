@@ -1,80 +1,91 @@
+const MAX_FACTORIAL_ARGUMENT = 170
+const FACTORIAL_TABLE = Float64[factorial(big(k)) for k in 0:MAX_FACTORIAL_ARGUMENT]
+
+"""
+    float_factorial(x)
+
+Factorial of `x` as a `Float64`, read from a precomputed table. Valid for
+`0 <= x <= 170` (Float64 factorials overflow at 171).
+"""
+@inline function float_factorial(x::Integer)
+    return @inbounds FACTORIAL_TABLE[Int(x) + 1]
+end
+
+"""
+    log_generalized_poisson_pdf(x, lambda, eta)
+
+Log probability mass function of the Generalized Poisson distribution at the
+non-negative integer `x` with rate `lambda` and dispersion `eta`. Used instead
+of the direct pmf whenever factorials would overflow.
+"""
+@inline function log_generalized_poisson_pdf(x::Integer, lambda::Real, eta::Real)
+    return log(lambda) + (x - 1) * log(lambda + x * eta) - lambda - x * eta -
+           logfactorial(x)
+end
+
 """
     poisson_distribution(x, lambda)
 
-Computes the probability mass function (PMF) of the Poisson distribution at a given count `x` with parameter `λ`.
-
-# Arguments
-- `x::Integer`: Non-negative integer value at which to evaluate the PMF.
-- `lambda::Real`: Positive rate parameter of the Poisson distribution.
-
-# Returns
-- `Real`: Probability of observing the value `x`.
+Probability mass function of the Poisson distribution at count `x` with rate
+`lambda`.
 """
-function poisson_distribution(x, lambda)
-    return exp(-lambda) * lambda^x / factorial(Int(x))
+function poisson_distribution(x::Real, lambda::Real)
+    xi = Int(x)
+    if xi <= MAX_FACTORIAL_ARGUMENT
+        return exp(-lambda) * lambda^xi / float_factorial(xi)
+    end
+    return exp(xi * log(lambda) - lambda - logfactorial(xi))
 end
 
 """
     generalized_poisson_distribution(x, lambda, eta)
 
-Computes the probability mass function of the Generalized Poisson distribution.
-
-# Arguments
-- `x::Integer`: Non-negative integer value at which to evaluate the PMF.
-- `lambda::Real`: Positive rate parameter.
-- `eta::Real`: Dispersion parameter.
-
-# Returns
-- `Real`: Probability of observing the value `x`.
+Probability mass function of the Generalized Poisson distribution at count `x`
+with rate `lambda` and dispersion `eta`. Uses a factorial lookup table for
+`x <= 170` and log-space evaluation beyond, so it never allocates `BigInt`s and
+is differentiable in `lambda` and `eta`.
 """
-function generalized_poisson_distribution(x, lambda, eta)
-    if x < 20
-        return exp(-lambda - x*eta) * lambda*(lambda + x*eta)^(x - 1) / factorial(Int(x))
-    else
-        return exp(-lambda - x*eta) * lambda*(lambda + x*eta)^(x - 1) / Float64(factorial(big(Int(x))))
+@inline function generalized_poisson_distribution(x::Real, lambda::Real, eta::Real)
+    xi = Int(x)
+    if xi <= MAX_FACTORIAL_ARGUMENT
+        return exp(-lambda - xi * eta) * lambda * (lambda + xi * eta)^(xi - 1) /
+               float_factorial(xi)
     end
+    return exp(log_generalized_poisson_pdf(xi, lambda, eta))
 end
 
 """
     bivariate_generalized_poisson(y, z, lambda, alpha1, alpha2, alpha3, eta)
 
-Computes the joint probability mass function of the bivariate generalized Poisson distribution.
-
-# Arguments
-- `y::Integer`: First observed count.
-- `z::Integer`: Second observed count.
-- `lambda::Real`: Base rate parameter.
-- `alpha1::Real`: Interaction parameter.
-- `alpha2::Real`: Interaction parameter.
-- `alpha3::Real`: Interaction parameter.
-- `eta::Real`: Dispersion parameter.
-
-# Returns
-- `Real`: Joint probability of observing counts `(y, z)`.
+Joint probability mass function of the bivariate Generalized Poisson
+distribution of two consecutive counts `(y, z)`. All loop-invariant quantities
+are hoisted; factorials come from the lookup table (log-space beyond 170).
 """
-function bivariate_generalized_poisson(y, z, lambda, alpha1, alpha2, alpha3, eta)
+function bivariate_generalized_poisson(y::Real, z::Real, lambda::Real, alpha1::Real,
+        alpha2::Real, alpha3::Real, eta::Real)
+    yi, zi = Int(y), Int(z)
     U = compute_U(alpha1, alpha2, alpha3)
-    beta3 = compute_beta_i(lambda, U, alpha3)
-    beta2 = compute_beta_i(lambda, U, alpha2)
     beta1 = compute_beta_i(lambda, U, alpha1)
+    beta3 = compute_beta_i(lambda, U, alpha3)
+    c = lambda * U * (1 - alpha1 - alpha3)
+    d = lambda * U * (alpha1 + alpha3)
 
-    sum = 0.0
-    if max(y,z) >= 20
-        for j in 0:min(y,z)
-            sum += (lambda*U*(1 - alpha1 - alpha3) + eta*(y - j))^(y - j - 1) *
-                   (lambda*U*(1 - alpha1 - alpha3) + eta*(z - j))^(z - j - 1) *
-                   (lambda*U*(alpha1 + alpha3) + eta*j)^(j - 1) /
-                   Float64(factorial(big(Int(j)))) / Float64(factorial(big(Int(y - j)))) /
-                   Float64(factorial(big(Int(z - j)))) * exp(j*eta)
+    total = zero(promote_type(typeof(c), typeof(eta)))
+    if max(yi, zi) <= MAX_FACTORIAL_ARGUMENT
+        for j in 0:min(yi, zi)
+            total += (c + eta * (yi - j))^(yi - j - 1) * (c + eta * (zi - j))^(zi - j - 1) *
+                     (d + eta * j)^(j - 1) / float_factorial(j) / float_factorial(yi - j) /
+                     float_factorial(zi - j) * exp(j * eta)
         end
     else
-        for j in 0:min(y,z)
-            sum += (lambda*U*(1 - alpha1 - alpha3) + eta*(y - j))^(y - j - 1) *
-                   (lambda*U*(1 - alpha1 - alpha3) + eta*(z - j))^(z - j - 1) *
-                   (lambda*U*(alpha1 + alpha3) + eta*j)^(j - 1) /
-                   factorial(Int(j)) / factorial(Int(y - j)) / factorial(Int(z - j)) * exp(j*eta)
+        for j in 0:min(yi, zi)
+            total += exp((yi - j - 1) * log(c + eta * (yi - j)) +
+                         (zi - j - 1) * log(c + eta * (zi - j)) +
+                         (j - 1) * log(d + eta * j) - logfactorial(j) -
+                         logfactorial(yi - j) - logfactorial(zi - j) + j * eta)
         end
     end
 
-    return sum * (beta1 + beta3) * (lambda*U*(1 - alpha1 - alpha3))^2 * exp(-(beta1 + beta3) - 2*(lambda*U*(1 - alpha1 - alpha3)) - y*eta - z*eta)
+    return total * (beta1 + beta3) * c^2 *
+           exp(-(beta1 + beta3) - 2 * c - yi * eta - zi * eta)
 end

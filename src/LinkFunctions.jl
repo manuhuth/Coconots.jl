@@ -1,105 +1,34 @@
 """
-    exponential_function(x)
-
-Applies the exponential function element-wise. Commonly used as a link function in integer autoregressive models.
-
-# Arguments
-- `x::Real or AbstractArray`: Input value(s) for which the exponential should be computed.
-
-# Returns
-- `Real or AbstractArray`: Exponential of input.nential_function(1.0) # returns exp(1.0)
-```
-"""
-function exponential_function(x)
-    return exp(x)
-end
-
-"""
-    logistic_function(x)
-
-Computes the logistic function (sigmoid) element-wise.
-
-# Arguments
-- `x::Real or AbstractArray`: Value(s) at which the logistic function should be evaluated.
-
-# Returns
-- `Real or AbstractArray`: Logistic function evaluated at input(s).
-"""
-function logistic_function(x)
-    return 1 / (1 + exp(-x))
-end
-
-"""
     relu(x)
 
-Computes a Rectified Linear Unit (ReLU) function, modified to avoid zero values by setting a lower bound at `1e-10`.
-
-# Arguments
-- `x::Real`: Input value.
-
-# Returns
-- `Real`: max(x, 1e-10).
+Rectified linear unit with a small positive floor: `max(x, 1e-10)`.
 """
-function relu(x::Real)
-    return max(x, 1e-10)
-end
+relu(x::Real) = max(x, 1e-10)
 
 """
     softplus(x)
 
-Computes the softplus function: log(1 + exp(x)). Always positive and smooth everywhere,
-making it a differentiable alternative to relu.
-
-# Arguments
-- `x::Real`: Input value.
-
-# Returns
-- `Real`: log(1 + exp(x)).
+Numerically stable softplus `log(1 + exp(x))`; always positive and smooth.
 """
-function softplus(x::Real)
-    return x > 0 ? x + log(1 + exp(-x)) : log(1 + exp(x))
-end
+softplus(x::Real) = x > 0 ? x + log1p(exp(-x)) : log1p(exp(x))
 
 """
     identity_func(x)
 
-Identity function that returns the input unchanged.
-
-# Arguments
-- `x`: Any input value or type.
-
-# Returns
-- `Same type as input`: The input unchanged.
+Identity function.
 """
-function identity_func(x)
-    return x
-end
+identity_func(x) = x
 
 """
     get_link_function(link_function)
 
-Retrieves the appropriate link function based on the provided string identifier.
-
-# Arguments
-- `link_function::String`: Name of the link function. Allowed values are:
-    - `"log"`: Exponential function (`exp`).
-    - `"identity"`: Identity function.
-    - `"relu"`: Rectified Linear Unit (ReLU).
-    - `"softplus"`: Softplus function log(1 + exp(x)), always positive and smooth.
-
-# Returns
-- `Function`: Corresponding link function.
+Link function for the innovation rate. Allowed names: `"log"` (returns
+`exp`), `"identity"`, `"relu"` and `"softplus"`.
 """
-function get_link_function(link_function::String)
-    if link_function == "log"
-        return exp
-    elseif link_function == "identity"
-        return identity_func
-    elseif link_function == "relu"
-        return relu
-    elseif link_function == "softplus"
-        return softplus
-    else
-        error("Unknown link function")
-    end
+function get_link_function(link_function::AbstractString)
+    link_function == "log" && return exp
+    link_function == "identity" && return identity_func
+    link_function == "relu" && return relu
+    link_function == "softplus" && return softplus
+    error("Unknown link function: $link_function")
 end
