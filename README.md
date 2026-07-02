@@ -9,7 +9,11 @@ The `Coconots` package provides a robust and user-friendly Julia framework for a
 - First- and higher-order integer autoregressive models
 - Supports Poisson and generalized Poisson distributions
 - Inclusion of covariates with customizable link functions
-- Efficient likelihood-based inference and forecasting
+- Efficient likelihood-based inference and forecasting: type-stable,
+  allocation-light convolution kernels with precomputed lookup tables
+- Optimization via the [Optimization.jl](https://github.com/SciML/Optimization.jl)
+  interface with pluggable solvers and automatic-differentiation backends
+  (ForwardDiff by default; Enzyme, ReverseDiff, etc. via `adtype`)
 - Comprehensive tools for model validation and diagnostics
 
 ## Installation
@@ -62,6 +66,31 @@ Fit a second-order model to simulated data:
 ```julia
 fit2 = cocoReg(type, order2, data2)
 ```
+
+Parameter constraints are handled by smooth parameter transformations by
+default, so the problem is solved unconstrained (with `LBFGS()`). The
+optimizer and the automatic-differentiation backend are pluggable: any
+Optimization.jl solver and any `ADTypes` backend can be used; extra keyword
+arguments are forwarded to `Optimization.solve`:
+
+```julia
+fit = cocoReg(type, order, data; adtype = Optimization.AutoForwardDiff(),
+    maxiters = 500)
+
+# solver-enforced box constraints instead of transformations:
+fit = cocoReg(type, order, data; box_constrained = true)  # Fminbox(LBFGS())
+
+# with Enzyme loaded, reverse-mode AD:
+# import Enzyme
+# fit = cocoReg(type, order, data; adtype = AutoEnzyme())
+```
+
+The likelihood evaluations are multithreaded, but a Julia process starts
+single-threaded by default: launch with `julia --threads=8` (or set
+`JULIA_NUM_THREADS`) to activate the parallel paths. Second-order fits on
+long or overdispersed series gain roughly 3x on 8 threads; when calling from
+R via JuliaConnectoR, set `Sys.setenv(JULIA_NUM_THREADS = "8")` before the
+first Julia call of the session.
 
 ### Model Diagnostics
 
