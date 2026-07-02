@@ -1,6 +1,23 @@
 # Coconots
 
-[![Build Status](https://github.com/manuhuth/Coconots.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/manuhuth/Coconots.jl/actions/workflows/CI.yml?query=branch%3Amain)
+<a href="https://github.com/manuhuth/Coconots.jl/actions/workflows/CI.yml?query=branch%3Amain">
+    <img src="https://github.com/manuhuth/Coconots.jl/actions/workflows/CI.yml/badge.svg?branch=main" alt="CI"/>
+</a>
+<a href="https://codecov.io/gh/manuhuth/Coconots.jl">
+    <img src="https://codecov.io/gh/manuhuth/Coconots.jl/branch/main/graph/badge.svg" alt="Coverage"/>
+</a>
+<a href="https://github.com/JuliaTesting/Aqua.jl">
+    <img src="https://juliatesting.github.io/Aqua.jl/dev/assets/badge.svg" alt="Aqua QA"/>
+</a>
+<a href="https://julialang.org">
+    <img src="https://img.shields.io/badge/Julia-1.10%2B-9558B2.svg?logo=julia&logoColor=white" alt="Julia 1.10+"/>
+</a>
+<a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"/>
+</a>
+<a href="https://www.repostatus.org/#active">
+    <img src="https://www.repostatus.org/badges/latest/active.svg" alt="Project Status: Active"/>
+</a>
 
 The `Coconots` package provides a robust and user-friendly Julia framework for analyzing time series consisting of low counts. Likelihood-based methods for model fitting, assessment and prediction analysis of some convolution-closed count time series model are provided. The marginal distribution can be Poisson or Generalized Poisson. Regression effects can be modelled via time varying innovation rates. 
 
