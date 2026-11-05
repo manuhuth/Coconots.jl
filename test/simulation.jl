@@ -1,7 +1,8 @@
 # Simulation: covariate alignment, start values, termination of the inversion
 # samplers and rate checks.
 
-const _SPIKE_BETA = [log(0.1), log(2000.0)]  # lambda = 0.1, and 200 at the spike
+const _SPIKE_BETA = [log(0.1), log(800.0)]  # lambda = 0.1, and 80 at the spike
+# (the spike stays below the count limit 170)
 
 _spike_covariates(n, t0) = hcat(ones(n), [t == t0 ? 1.0 : 0.0 for t in 1:n])
 
@@ -26,7 +27,7 @@ end
                 _spike_covariates(n, t0), "log", 0)
             @test length(x) == n
             @test argmax(x) == t0
-            @test x[t0] > 100
+            @test x[t0] > 40
         end
     end
 end
@@ -72,10 +73,27 @@ end
               _plain_gp_inversion(u, 3.0, 0.3)
         @test Coconots._draw_innovation!(s, u) == _plain_gp_inversion(u, 3.0, 0.3)
     end
-    # a cdf that stays far below 1 beyond the bound is an error
-    @test_throws ErrorException Coconots._gp_inversion_stop(5000, 0.5, 0.5, 100, 1.0,
-        0.1)
-    @test !Coconots._gp_inversion_stop(50, 0.5, 0.6, 100, 1.0, 0.1)
+    # saturation rule: vanished increment with 1 - F <= 1e-8 stops, otherwise not
+    @test Coconots._gp_inversion_stop(1 - 1e-12, 1 - 1e-12)
+    @test !Coconots._gp_inversion_stop(0.5, 0.5)
+    @test !Coconots._gp_inversion_stop(0.5, 0.6)
+    # a draw above 170 throws the count-limit error (both samplers); a cdf that
+    # stays near 0 (large lambda) ends there as well
+    for (u, lam, eta) in ((0.999, 160.0, 0.2), (0.5, 1000.0, 0.0))
+        err = try
+            Coconots.draw_random_generalized_poisson_variable(u, lam, eta)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("counts above 170 are not supported", err.msg)
+        s = Coconots._TransitionSampler(1, 0.3, 0.0, 0.0, 0.0, eta)
+        Coconots._set_rate!(s, lam)
+        @test_throws ArgumentError Coconots._draw_innovation!(s, u)
+    end
+    @test_throws ArgumentError cocoSim("GP", 1, [0.2, 0.2, 300.0], 20)
+    @test_throws ArgumentError cocoSim("Poisson", 2, [0.2, 0.1, 0.2, 300.0], 20)
     # thinning parts: u = 1 gives the support maximum
     @test Coconots.draw_random_g_r_y_variable(1.0, 5, 0.5, 0.2, 1.0) == 5
     @test Coconots.draw_random_g_r_y_z_variable(1.0, 3, 2, 1.0, 0.3, 0.1, 0.2, 0.2,

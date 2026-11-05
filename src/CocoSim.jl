@@ -2,49 +2,41 @@ export cocoSim
 
 # Termination of the Generalized Poisson inversion (as `GPInvCdf` in the C++
 # backend). In floating point the accumulated cdf F can stay below u forever
-# (its increments round to zero once they fall below half an ulp of F). When
-# the next value F(i) is still < u:
-#  - if the increment vanished (F(i) == F(i - 1)) and 1 - F(i - 1) <=
-#    `_GP_INVERSION_SATURATION_TOL`, F has saturated: beyond the bulk the pmf
-#    decreases, so F keeps this value for all larger i, the remaining mass is at
-#    rounding level, and i is returned;
-#  - if i exceeds `_gp_inversion_upper` (mean + 40 sd + 1000) and either the
-#    increment vanished or F(i - 1) < 1 - `_GP_INVERSION_TAIL_BOUND`, an error is
-#    raised (by Chebyshev's inequality the exact F exceeds 1 - 1/1600 there).
-# Draws are otherwise those of the plain inversion; no extra uniforms are used.
+# (its increments round to zero once they fall below half an ulp of F). Two
+# rules bound the inversion:
+#  - when the next value F(i) is still < u, the increment vanished
+#    (F(i) == F(i - 1)) and 1 - F(i - 1) <= `_GP_INVERSION_SATURATION_TOL`, F
+#    has saturated: beyond the bulk the pmf decreases, so F keeps this value for
+#    all larger i, the remaining mass is at rounding level, and i is returned;
+#  - a draw above `MAX_FACTORIAL_ARGUMENT` (170) is outside the supported range
+#    of counts (as on the RCPP backend): once F(170) < u the inversion throws the
+#    count-limit `ArgumentError` (`_gp_count_limit_error`).
+# Draws <= 170 are otherwise those of the plain inversion; no extra uniforms are
+# used.
 const _GP_INVERSION_SATURATION_TOL = 1e-8
-const _GP_INVERSION_TAIL_BOUND = 1e-3
-const _GP_INVERSION_MAX = 1_000_000_000
 
 """
-    _gp_inversion_upper(lambda, eta)
+    _gp_inversion_stop(previous, next)
 
-Count beyond which the Generalized Poisson inversion must have (numerically)
-converged: `mean + 40 sd + 1000`, at most `_GP_INVERSION_MAX`.
+Saturation rule of the inversion with `F(i - 1) = previous` and
+`F(i) = next < u` (see the comment above): `true` if `i` is returned, `false`
+to continue.
 """
-function _gp_inversion_upper(lambda::Real, eta::Real)
-    (isfinite(lambda) && lambda > 0 && eta < 1) || return _GP_INVERSION_MAX
-    a = 1 - Float64(eta)
-    up = ceil(Float64(lambda) / a + 40 * sqrt(Float64(lambda) / a^3)) + 1000
-    return up < _GP_INVERSION_MAX ? Int(up) : _GP_INVERSION_MAX
+@inline function _gp_inversion_stop(previous::Real, next::Real)
+    return !(next > previous) && 1 - previous <= _GP_INVERSION_SATURATION_TOL
 end
 
 """
-    _gp_inversion_stop(i, previous, next, upper, lambda, eta)
+    _gp_count_limit_error(lambda, eta)
 
-Termination rule of the inversion at count `i` with `F(i - 1) = previous` and
-`F(i) = next < u` (see the comment above): `true` if `i` is returned, an error
-if the cdf cannot be evaluated accurately, `false` to continue.
+Throws the count-limit `ArgumentError` for a Generalized Poisson innovation
+above `MAX_FACTORIAL_ARGUMENT` (`F(170) < u` in the inversion).
 """
-@inline function _gp_inversion_stop(i::Int, previous::Real, next::Real, upper::Int,
-        lambda::Real, eta::Real)
-    vanished = !(next > previous)
-    vanished && 1 - previous <= _GP_INVERSION_SATURATION_TOL && return true
-    if i > upper && (vanished || previous < 1 - _GP_INVERSION_TAIL_BOUND)
-        error("Generalized Poisson inversion did not converge: the cumulative " *
-              "probability stays at $(previous) < 1 (lambda = $(lambda), eta = $(eta))")
-    end
-    return false
+@noinline function _gp_count_limit_error(lambda::Real, eta::Real)
+    throw(ArgumentError("coconots: counts above $(MAX_FACTORIAL_ARGUMENT) are not " *
+                        "supported (factorial overflow above $(MAX_FACTORIAL_ARGUMENT)); " *
+                        "a simulated Generalized Poisson innovation exceeds " *
+                        "$(MAX_FACTORIAL_ARGUMENT) (lambda = $(lambda), eta = $(eta))"))
 end
 
 """
@@ -56,12 +48,13 @@ of the uniform variate `u` (smallest `i` with `F(i) >= u`; see
 """
 function draw_random_generalized_poisson_variable(u::Real, lambda::Real, eta::Real)
     cumulative = generalized_poisson_distribution(0, lambda, eta)
-    upper = _gp_inversion_upper(lambda, eta)
     i = 0
     while cumulative < u
+        # F(i) < u: the draw is above i
+        i >= MAX_FACTORIAL_ARGUMENT && _gp_count_limit_error(lambda, eta)
         i += 1
         next = cumulative + generalized_poisson_distribution(i, lambda, eta)
-        if next < u && _gp_inversion_stop(i, cumulative, next, upper, lambda, eta)
+        if next < u && _gp_inversion_stop(cumulative, next)
             return i
         end
         cumulative = next
@@ -231,8 +224,6 @@ mutable struct _TransitionSampler
     gbuf::Vector{Float64}
     hbuf::Vector{Float64}
     scratch::Vector{Float64}
-    # _gp_inversion_upper(lambda, eta) of the current rate
-    innovation_upper::Int
 end
 
 function _TransitionSampler(order::Int, alpha::Float64, alpha1::Float64, alpha2::Float64,
@@ -242,7 +233,7 @@ function _TransitionSampler(order::Int, alpha::Float64, alpha1::Float64, alpha2:
         Float64[], zeros(Int, 0, 0), zeros(Int, 0, 0), 1, Float64[],
         (Float64[], Float64[], Float64[], Float64[], Float64[]), nothing, -1,
         Float64[], -1, -1, Float64[], Int[], Int[], Float64[], Float64[], Float64[],
-        Float64[], 0)
+        Float64[])
 end
 
 """
@@ -254,7 +245,6 @@ when the rate changes.
 function _set_rate!(s::_TransitionSampler, lambda::Float64)
     lambda == s.lambda && return s
     s.lambda = lambda
-    s.innovation_upper = _gp_inversion_upper(lambda, s.eta)
     empty!(s.innovation_cdf)
     s.stamp += 1
     empty!(s.g_store)
@@ -292,10 +282,11 @@ function _draw_innovation!(s::_TransitionSampler, u::Float64)
         end
         @inbounds c = cdf[i + 1]
         c < u || return i
-        if i > 0 && _gp_inversion_stop(i, @inbounds(cdf[i]), c, s.innovation_upper,
-            s.lambda, s.eta)
+        if i > 0 && _gp_inversion_stop(@inbounds(cdf[i]), c)
             return i
         end
+        # F(i) < u: the draw is above i
+        i >= MAX_FACTORIAL_ARGUMENT && _gp_count_limit_error(s.lambda, s.eta)
         i += 1
     end
 end
