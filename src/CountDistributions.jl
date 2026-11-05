@@ -2,6 +2,69 @@ const MAX_FACTORIAL_ARGUMENT = 170
 const FACTORIAL_TABLE = Float64[factorial(big(k)) for k in 0:MAX_FACTORIAL_ARGUMENT]
 
 """
+    _check_count_limit(data, what = "observed")
+
+Throws an `ArgumentError` if a count in `data` exceeds `MAX_FACTORIAL_ARGUMENT`
+(170). Counts above it are outside the supported range of the package: Float64
+factorials overflow at 171, and the RCPP backend of coconots rejects such counts,
+so both backends accept and reject the same inputs. `what` names the counts in
+the message (`"observed"`, `"simulated"`).
+"""
+function _check_count_limit(data, what::AbstractString = "observed")
+    isempty(data) && return nothing
+    m = maximum(data)
+    if m > MAX_FACTORIAL_ARGUMENT
+        throw(ArgumentError("coconots: counts above $(MAX_FACTORIAL_ARGUMENT) are not " *
+                            "supported (factorial overflow above $(MAX_FACTORIAL_ARGUMENT)); " *
+                            "$what count = $m"))
+    end
+    return nothing
+end
+
+"""
+    _check_support_limit(value, name)
+
+Throws an `ArgumentError` if the largest support point `value` of a requested
+pmf (argument `name`, e.g. `max_x` of [`compute_scores`](@ref)) exceeds
+`MAX_FACTORIAL_ARGUMENT`.
+"""
+function _check_support_limit(value::Integer, name::AbstractString)
+    if value > MAX_FACTORIAL_ARGUMENT
+        throw(ArgumentError("coconots: '$name' = $value exceeds the largest supported " *
+                            "count $(MAX_FACTORIAL_ARGUMENT) (counts above " *
+                            "$(MAX_FACTORIAL_ARGUMENT) are not supported: factorial overflow)"))
+    end
+    return nothing
+end
+
+"""
+    _check_min_length(n, min_n, fun, reason)
+
+Throws an `ArgumentError` if a series of length `n` is shorter than `min_n`.
+"""
+function _check_min_length(n::Integer, min_n::Integer, fun::AbstractString,
+        reason::AbstractString)
+    if n < min_n
+        throw(ArgumentError("$fun: the time series has $n observation(s), but at least " *
+                            "$min_n are required ($reason)"))
+    end
+    return nothing
+end
+
+"""
+    _throw_nonfinite_pmf(what)
+
+Throws an error for a non-finite (NaN or Inf) probability, which arises from
+floating-point overflow in the density recursions.
+"""
+function _throw_nonfinite_pmf(what::AbstractString)
+    throw(DomainError(what, "coconots: the $what is not finite (floating-point " *
+                            "overflow in the density recursions for these counts and " *
+                            "parameters; this can happen for counts close to the " *
+                            "supported maximum of $(MAX_FACTORIAL_ARGUMENT) with a large eta)"))
+end
+
+"""
     float_factorial(x)
 
 Factorial of `x` as a `Float64`, read from a precomputed table. Valid for
