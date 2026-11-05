@@ -222,7 +222,7 @@ function cocoReg(type, order, data, covariates = nothing, starting_values = noth
 
     starting_values = get_starting_values!(type, order, data_int, covariates,
         starting_values, _n_parameters_without_covariates(type, order),
-        lower_bound_covariates)
+        lower_bound_covariates, link_function)
     lower, upper = get_bounds(order, type, covariates, lower_bound_covariates)
 
     objective = _make_objective(type, order, data_int, covariates, link_function,
