@@ -81,6 +81,7 @@ function cocoForwardSim(n, x_prev, type, order, parameter, covariates = nothing,
     else
         lambda = fill(float(last(parameter)), n_total)
     end
+    _check_simulation_rates(lambda)
 
     for t in 3:n_total
         x[t] = draw_random_g(order, rand(), Int(x[t - 1]), Int(x[t - 2]), lambda[t - 2],
