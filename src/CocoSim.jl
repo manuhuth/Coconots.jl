@@ -82,11 +82,29 @@ end
 # once per rate and history and invert them with the same uniform and the same
 # stopping rule as the scalar functions above, so the draws follow the same law;
 # only the order of the floating-point summation inside g(r | y, z) differs.
+#
+# The cumulative distributions of g are stored back to back in one flat buffer
+# and located through a dense (y, z) index whose cells are valid only if their
+# stamp equals the sampler's current stamp; a rate change invalidates all of
+# them in O(1) by incrementing the stamp (no hashing, no per-history vectors).
+#
+# Second order: the pmf tables of the derived rates are built once per rate by
+# recurrences (`_fill_gp_table_rec!`), sized to the largest history of the
+# current step, and the inner sum H(a, b) of g(r | y, z) (see `_gp2_h_cell`),
+# which does not depend on (y, z) when the s-range is not truncated, is
+# tabulated once per rate on the needed block and shared by all histories.
 #--------------------------------------------------------------------------------------
 
 # Upper bound on the number of cached cumulative-distribution entries per rate
 # (Float64 values); histories beyond it are evaluated in a scratch buffer.
 const _SIM_CACHE_MAX_ENTRIES = 4_194_304
+
+# Histories with y or z at or above this bound are not indexed (scratch buffer).
+const _SIM_CACHE_MAX_DIM = 1024
+
+# Upper bound on the number of cells of the shared inner-sum table H(a, b);
+# histories outside it compute their own block of H.
+const _SHARED_H_MAX_CELLS = 65_536
 
 """
     _invert_cdf(cdf, u, upper)
@@ -95,8 +113,18 @@ Smallest `i` in `0:(upper - 1)` with `!(cdf[i + 1] < u)`, else `upper`. This is
 the stopping rule of the sequential inverse-transform loops above.
 """
 @inline function _invert_cdf(cdf::Vector{Float64}, u::Float64, upper::Int)
+    return _invert_cdf(cdf, 1, u, upper)
+end
+
+"""
+    _invert_cdf(store, offset, u, upper)
+
+As `_invert_cdf(cdf, u, upper)` for the cumulative distribution stored at
+`store[offset:(offset + upper)]`.
+"""
+@inline function _invert_cdf(store::Vector{Float64}, offset::Int, u::Float64, upper::Int)
     @inbounds for i in 0:(upper - 1)
-        cdf[i + 1] < u || return i
+        store[offset + i] < u || return i
     end
     return upper
 end
@@ -108,13 +136,23 @@ mutable struct _TransitionSampler
     alpha2::Float64
     alpha3::Float64
     eta::Float64
+    U::Float64
     lambda::Float64
     innovation_cdf::Vector{Float64}
-    g_cdfs::Dict{Tuple{Int, Int}, Vector{Float64}}
-    cached_entries::Int
+    # cell (y + 1, z + 1): offset of the cdf of g(. | y[, z]) in g_store, valid
+    # iff g_stamp[y + 1, z + 1] == stamp
+    g_offset::Matrix{Int}
+    g_stamp::Matrix{Int}
+    stamp::Int
+    g_store::Vector{Float64}
     tables::NTuple{5, Vector{Float64}}
     kernel::Union{Nothing, GP2Kernel{Float64}}
     kernel_max::Int
+    # shared inner sums H(a, b) = h[b * (h_amax + 1) + a + 1], a in 0:h_amax,
+    # b in 0:h_bmax (empty if h_amax < 0)
+    h::Vector{Float64}
+    h_amax::Int
+    h_bmax::Int
     gbuf::Vector{Float64}
     hbuf::Vector{Float64}
     scratch::Vector{Float64}
@@ -122,10 +160,11 @@ end
 
 function _TransitionSampler(order::Int, alpha::Float64, alpha1::Float64, alpha2::Float64,
         alpha3::Float64, eta::Float64)
-    return _TransitionSampler(order, alpha, alpha1, alpha2, alpha3, eta, NaN,
-        Float64[], Dict{Tuple{Int, Int}, Vector{Float64}}(), 0,
+    U = order == 2 ? Float64(compute_U(alpha1, alpha2, alpha3)) : NaN
+    return _TransitionSampler(order, alpha, alpha1, alpha2, alpha3, eta, U, NaN,
+        Float64[], zeros(Int, 0, 0), zeros(Int, 0, 0), 1, Float64[],
         (Float64[], Float64[], Float64[], Float64[], Float64[]), nothing, -1,
-        Float64[], Float64[], Float64[])
+        Float64[], -1, -1, Float64[], Float64[], Float64[])
 end
 
 """
@@ -138,10 +177,12 @@ function _set_rate!(s::_TransitionSampler, lambda::Float64)
     lambda == s.lambda && return s
     s.lambda = lambda
     empty!(s.innovation_cdf)
-    empty!(s.g_cdfs)
-    s.cached_entries = 0
+    s.stamp += 1
+    empty!(s.g_store)
     s.kernel = nothing
     s.kernel_max = -1
+    s.h_amax = -1
+    s.h_bmax = -1
     return s
 end
 
@@ -176,39 +217,126 @@ function _draw_innovation!(s::_TransitionSampler, u::Float64)
     return upper
 end
 
+"""
+    _ensure_kernel!(sampler, needed)
+
+Second-order pmf tables of `beta1`, `beta2`, `beta3`, `lambda` and `zeta` at
+the sampler's rate on (at least) `0:needed`, built by the recurrences of
+[`_fill_gp_table_rec!`](@ref) (equal to the per-entry pmf up to rounding).
+"""
 function _ensure_kernel!(s::_TransitionSampler, needed::Int)
     if s.kernel === nothing || s.kernel_max < needed
-        s.kernel = _gp2_kernel!(s.tables, s.lambda, s.alpha1, s.alpha2, s.alpha3, s.eta,
-            needed)
+        lambda = s.lambda
+        eta = s.eta
+        q = exp(-eta)
+        eta_is_zero = iszero(eta)
+        lambda_U = lambda * s.U
+        tb1, tb2, tb3, tl, tz = s.tables
+        _fill_gp_table_rec!(tb1, needed, lambda_U * s.alpha1, eta, q, eta_is_zero)
+        _fill_gp_table_rec!(tb2, needed, lambda_U * s.alpha2, eta, q, eta_is_zero)
+        _fill_gp_table_rec!(tb3, needed, lambda_U * s.alpha3, eta, q, eta_is_zero)
+        _fill_gp_table_rec!(tl, needed, lambda, eta, q, eta_is_zero)
+        _fill_gp_table_rec!(tz, needed, lambda_U * (1 - 2 * s.alpha1 - s.alpha3), eta,
+            q, eta_is_zero)
+        s.kernel = GP2Kernel{Float64}(lambda, s.alpha1, s.alpha2, s.alpha3, eta, tb1,
+            tb2, tb3, tl, tz)
         s.kernel_max = needed
     end
     return s.kernel::GP2Kernel{Float64}
 end
 
 """
-    _g_cdf!(cdf, sampler, y, z)
+    _prepare_order2_step!(sampler, ymax, zmax)
+
+Called once per time step (after `_set_rate!`) with the largest `y = X_{t-1}`
+and `z = X_{t-2}` over the replicates: sizes the pmf tables to `ymax + zmax`
+and extends the shared inner-sum table to `a in 0:zmax`, `b in 0:ymax` (within
+`_SHARED_H_MAX_CELLS`). Under a fixed rate both only grow.
+"""
+function _prepare_order2_step!(s::_TransitionSampler, ymax::Int, zmax::Int)
+    kernel = _ensure_kernel!(s, ymax + zmax)
+    (zmax <= s.h_amax && ymax <= s.h_bmax) && return s
+    amax = max(zmax, s.h_amax)
+    bmax = max(ymax, s.h_bmax)
+    na = amax + 1
+    na * (bmax + 1) > _SHARED_H_MAX_CELLS && return s
+    h = s.h
+    length(h) < na * (bmax + 1) && resize!(h, na * (bmax + 1))
+    # cap = b: min(cap, a, b) = min(a, b), the untruncated inner sum, which is
+    # what g(r | y, z) reads for every b <= y (s-range 0:y)
+    @inbounds for b in 0:bmax, a in 0:amax
+        h[b * na + a + 1] = _gp2_h_cell(kernel, a, b, b)
+    end
+    s.h_amax = amax
+    s.h_bmax = bmax
+    return s
+end
+
+"""
+    _gp2_sampler_normalizer(sampler, y, z)
+
+Bivariate Generalized Poisson mass of `(y, z)` at the sampler's rate
+([`_gp2_normalizer`](@ref) for `max(y, z) <= 170`, else
+[`bivariate_generalized_poisson`](@ref)).
+"""
+function _gp2_sampler_normalizer(s::_TransitionSampler, y::Int, z::Int)
+    if max(y, z) <= MAX_FACTORIAL_ARGUMENT
+        lambda_U = s.lambda * s.U
+        return _gp2_normalizer(y, z, lambda_U * (1 - s.alpha1 - s.alpha3),
+            lambda_U * (s.alpha1 + s.alpha3), lambda_U * s.alpha1 + lambda_U * s.alpha3,
+            s.eta, exp(s.eta), iszero(s.eta))
+    end
+    return bivariate_generalized_poisson(y, z, s.lambda, s.alpha1, s.alpha2, s.alpha3,
+        s.eta)
+end
+
+"""
+    _g_cdf!(store, offset, sampler, y, z)
 
 Cumulative distribution of `g(r | y)` (order 1, support `0:y`) or
 `g(r | y, z)` (order 2, support `0:(y + z)`) at the sampler's rate, written
-into `cdf`.
+into `store[offset:(offset + upper)]`.
 """
-function _g_cdf!(cdf::Vector{Float64}, s::_TransitionSampler, y::Int, z::Int)
+function _g_cdf!(store::Vector{Float64}, offset::Int, s::_TransitionSampler, y::Int,
+        z::Int)
     total = 0.0
     if s.order == 1
         @inbounds for r in 0:y
             total += compute_g_r_y(y, r, s.alpha, s.eta, s.lambda)
-            cdf[r + 1] = total
+            store[offset + r] = total
         end
-        return cdf
+        return store
     end
     upper = y + z
     kernel = _ensure_kernel!(s, upper)
-    g = _gp2_g_vector!(s.gbuf, s.hbuf, kernel, y, z, upper, nothing)
+    if y <= s.h_bmax && z <= s.h_amax
+        gbuf = s.gbuf
+        length(gbuf) < upper + 1 && resize!(gbuf, upper + 1)
+        normalizer = _gp2_sampler_normalizer(s, y, z)
+        base = range(0; step = s.h_amax + 1, length = y + 1)
+        g = _gp2_g_vector!(gbuf, kernel, s.h, base, y, z, upper, normalizer, y)
+    else
+        g = _gp2_g_vector!(s.gbuf, s.hbuf, kernel, y, z, upper, nothing)
+    end
     @inbounds for r in 0:upper
         total += g[r + 1]
-        cdf[r + 1] = total
+        store[offset + r] = total
     end
-    return cdf
+    return store
+end
+
+function _grow_cdf_index!(s::_TransitionSampler, ny::Int, nz::Int)
+    oy, oz = size(s.g_stamp)
+    (ny <= oy && nz <= oz) && return s
+    my = ny <= oy ? oy : min(_SIM_CACHE_MAX_DIM, max(ny, 2 * oy, 16))
+    mz = nz <= oz ? oz : min(_SIM_CACHE_MAX_DIM, max(nz, 2 * oz, s.order == 1 ? 1 : 16))
+    stamp = zeros(Int, my, mz)
+    offset = zeros(Int, my, mz)
+    stamp[1:oy, 1:oz] .= s.g_stamp
+    offset[1:oy, 1:oz] .= s.g_offset
+    s.g_stamp = stamp
+    s.g_offset = offset
+    return s
 end
 
 """
@@ -218,19 +346,30 @@ Same draw as [`draw_random_g`](@ref) at the sampler's rate, from a cached
 cumulative distribution per history `(y[, z])`.
 """
 function _draw_g!(s::_TransitionSampler, u::Float64, y::Int, z::Int)
-    upper = s.order == 1 ? y : y + z
-    key = s.order == 1 ? (y, 0) : (y, z)
-    cdf = get(s.g_cdfs, key, nothing)
-    if cdf === nothing
-        if s.cached_entries + upper + 1 <= _SIM_CACHE_MAX_ENTRIES
-            cdf = _g_cdf!(Vector{Float64}(undef, upper + 1), s, y, z)
-            s.g_cdfs[key] = cdf
-            s.cached_entries += upper + 1
-        else
-            cdf = _g_cdf!(resize!(s.scratch, upper + 1), s, y, z)
-        end
+    if s.order == 1
+        upper = y
+        zk = 0
+    else
+        upper = y + z
+        zk = z
     end
-    return _invert_cdf(cdf, u, upper)
+    nonnegative = y >= 0 && zk >= 0
+    if nonnegative && y < size(s.g_stamp, 1) && zk < size(s.g_stamp, 2) &&
+       @inbounds(s.g_stamp[y + 1, zk + 1]) == s.stamp
+        return _invert_cdf(s.g_store, @inbounds(s.g_offset[y + 1, zk + 1]), u, upper)
+    end
+    offset = length(s.g_store) + 1
+    if nonnegative && offset + upper <= _SIM_CACHE_MAX_ENTRIES &&
+       y < _SIM_CACHE_MAX_DIM && zk < _SIM_CACHE_MAX_DIM
+        _grow_cdf_index!(s, y + 1, zk + 1)
+        resize!(s.g_store, offset + upper)
+        _g_cdf!(s.g_store, offset, s, y, zk)
+        @inbounds s.g_offset[y + 1, zk + 1] = offset
+        @inbounds s.g_stamp[y + 1, zk + 1] = s.stamp
+        return _invert_cdf(s.g_store, offset, u, upper)
+    end
+    _g_cdf!(resize!(s.scratch, upper + 1), 1, s, y, zk)
+    return _invert_cdf(s.scratch, 1, u, upper)
 end
 
 """
@@ -292,14 +431,30 @@ function _simulate_paths!(X::AbstractMatrix{Int}, s::_TransitionSampler,
         t_first = 3
     end
 
+    # colmax[t]: largest count of column t over the replicates (sizes the
+    # second-order tables of the next two steps)
+    colmax = zeros(Int, n_total)
+    for t in 1:min(t_first - 1, n_total)
+        for b in 1:n_rep
+            colmax[t] = max(colmax[t], X[b, t])
+        end
+    end
+
     for t in t_first:n_total
         _set_rate!(s, lambda[t])
+        if order == 2
+            _prepare_order2_step!(s, colmax[t - 1], t > 2 ? colmax[t - 2] : 0)
+        end
+        m = 0
         for b in 1:n_rep
             y = X[b, t - 1]
             z = t > 2 ? X[b, t - 2] : 0
             r = _draw_g!(s, rand(), y, z)
-            X[b, t] = r + _draw_innovation!(s, rand())
+            x = r + _draw_innovation!(s, rand())
+            X[b, t] = x
+            m = max(m, x)
         end
+        colmax[t] = m
     end
     return X
 end
