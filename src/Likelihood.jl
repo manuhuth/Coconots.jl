@@ -148,18 +148,118 @@ function _check_kernel_size(kernel::GP2Kernel, required_index::Integer)
     return nothing
 end
 
-function convolution_x_r_y_z(kernel::GP2Kernel{T}, x::Integer, y::Integer, z::Integer,
-        max_loop) where {T}
-    _check_kernel_size(kernel, max(x, y + z))
+"""
+    _gp2_kernel!(tables, lambda, alpha1, alpha2, alpha3, eta, max_index)
+
+Same as [`GP2Kernel`](@ref), but fills the five caller-owned `tables`
+(resized to `max_index + 1`) instead of allocating new ones. The returned
+kernel aliases `tables`, so it is only valid until the next call.
+"""
+function _gp2_kernel!(tables::NTuple{5, Vector{T}}, lambda::Real, alpha1::Real,
+        alpha2::Real, alpha3::Real, eta::Real, max_index::Integer) where {T}
+    U = compute_U(alpha1, alpha2, alpha3)
+    _fill_gp_table!(tables[1], compute_beta_i(lambda, U, alpha1), eta, max_index)
+    _fill_gp_table!(tables[2], compute_beta_i(lambda, U, alpha2), eta, max_index)
+    _fill_gp_table!(tables[3], compute_beta_i(lambda, U, alpha3), eta, max_index)
+    _fill_gp_table!(tables[4], lambda, eta, max_index)
+    _fill_gp_table!(tables[5], compute_zeta(lambda, U, alpha1, alpha3), eta, max_index)
+    return GP2Kernel{T}(lambda, alpha1, alpha2, alpha3, eta, tables...)
+end
+
+function _fill_gp_table!(table::Vector, rate::Real, eta::Real, max_index::Integer)
+    resize!(table, max_index + 1)
+    @inbounds for i in 0:max_index
+        table[i + 1] = generalized_poisson_distribution(i, rate, eta)
+    end
+    return table
+end
+
+"""
+    _gp2_h_cell(kernel, a, b, cap)
+
+Innermost sum of `g(r | y, z)`:
+`H(a, b) = sum_{w = 0}^{min(cap, a, b)} P_beta1(w) P_lambda(a - w) P_zeta(b - w)`.
+It depends on the outer indices `(r, s, v)` only through `a = z - r + v` and
+`b = y - s - v`, so tabulating it once per `(a, b)` removes the repeated
+evaluation of identical inner sums.
+"""
+@inline function _gp2_h_cell(kernel::GP2Kernel{T}, a::Int, b::Int, cap::Int) where {T}
+    acc = zero(T)
+    @inbounds for w in 0:min(cap, a, b)
+        acc += kernel.gp_beta1[w + 1] * kernel.gp_lambda[a - w + 1] *
+               kernel.gp_zeta[b - w + 1]
+    end
+    return acc
+end
+
+"""
+    _gp2_g_vector!(g, kernel, h, base, y, z, rmax, normalizer, smax)
+
+Writes `g(r | y, z)` for `r = 0, ..., rmax` into `g[1:rmax+1]`, reading the
+inner sums `H(a, b)` (see [`_gp2_h_cell`](@ref)) from `h[base[b + 1] + a + 1]`.
+The table must cover `a in max(0, z - rmax):z` for every `b in 0:y`, with a
+`cap` that is equivalent to `smax` on `b <= y`. Same sum as
+[`compute_g_r_y_z`](@ref); the `v` range starts at `max(0, r - z)` because
+smaller `v` have an empty `w` range there.
+"""
+function _gp2_g_vector!(g::AbstractVector{T}, kernel::GP2Kernel{T}, h::Vector{T},
+        base::AbstractVector{Int}, y::Int, z::Int, rmax::Int, normalizer::Real,
+        smax::Int) where {T}
+    @inbounds for r in 0:rmax
+        total = zero(T)
+        for s in 0:min(smax, r, y)
+            ps = kernel.gp_beta3[s + 1]
+            for v in max(0, r - z):min(smax, r - s, y - s)
+                total += ps * kernel.gp_beta1[v + 1] * kernel.gp_beta2[r - s - v + 1] *
+                         h[base[y - s - v + 1] + z - r + v + 1]
+            end
+        end
+        g[r + 1] = total / normalizer
+    end
+    return g
+end
+
+"""
+    _gp2_g_vector!(g, h, kernel, y, z, rmax, max_loop)
+
+Stand-alone version for one `(y, z)` history: computes the normalizer and the
+needed block `a in max(0, z - rmax):z`, `b in 0:y` of the inner-sum table in
+the caller-owned buffers `g` and `h` (resized if needed) and returns `g`
+holding `g(r | y, z)` for `r = 0, ..., rmax`.
+"""
+function _gp2_g_vector!(g::Vector{T}, h::Vector{T}, kernel::GP2Kernel{T}, y::Int,
+        z::Int, rmax::Int, max_loop) where {T}
+    rmax < 0 && return g
     smax = max_loop === nothing ? y : Int(max_loop)
     normalizer = bivariate_generalized_poisson(y, z, kernel.lambda, kernel.alpha1,
         kernel.alpha2, kernel.alpha3, kernel.eta)
+    length(g) < rmax + 1 && resize!(g, rmax + 1)
+    a_lo = max(0, z - rmax)
+    na = z - a_lo + 1
+    length(h) < na * (y + 1) && resize!(h, na * (y + 1))
+    @inbounds for b in 0:y, a in a_lo:z
+        h[b * na + (a - a_lo) + 1] = _gp2_h_cell(kernel, a, b, smax)
+    end
+    # h[b * na + (a - a_lo) + 1] == h[base[b + 1] + a + 1] with this base
+    base = range(-a_lo; step = na, length = y + 1)
+    return _gp2_g_vector!(g, kernel, h, base, y, z, rmax, normalizer, smax)
+end
+
+function _convolution_x_r_y_z!(g::Vector{T}, h::Vector{T}, kernel::GP2Kernel{T},
+        x::Integer, y::Integer, z::Integer, max_loop) where {T}
+    _check_kernel_size(kernel, max(x, y + z))
+    rmax = min(Int(x), Int(y) + Int(z))
+    _gp2_g_vector!(g, h, kernel, Int(y), Int(z), rmax, max_loop)
     total = zero(T)
-    @inbounds for r in 0:min(x, y + z)
-        total += compute_g_r_y_z(kernel, r, y, z, normalizer, smax) *
-                 kernel.gp_lambda[x - r + 1]
+    @inbounds for r in 0:rmax
+        total += g[r + 1] * kernel.gp_lambda[x - r + 1]
     end
     return total
+end
+
+function convolution_x_r_y_z(kernel::GP2Kernel{T}, x::Integer, y::Integer, z::Integer,
+        max_loop) where {T}
+    return _convolution_x_r_y_z!(T[], T[], kernel, x, y, z, max_loop)
 end
 
 """
@@ -173,11 +273,8 @@ single linear convolution pass.
 function convolution_pmf_vector(kernel::GP2Kernel{T}, xmax::Integer, y::Integer,
         z::Integer, max_loop) where {T}
     _check_kernel_size(kernel, max(xmax, y + z))
-    smax = max_loop === nothing ? y : Int(max_loop)
-    normalizer = bivariate_generalized_poisson(y, z, kernel.lambda, kernel.alpha1,
-        kernel.alpha2, kernel.alpha3, kernel.eta)
-    rmax = min(xmax, y + z)
-    g = T[compute_g_r_y_z(kernel, r, y, z, normalizer, smax) for r in 0:rmax]
+    rmax = min(Int(xmax), Int(y) + Int(z))
+    g = _gp2_g_vector!(T[], T[], kernel, Int(y), Int(z), rmax, max_loop)
     pmf = Vector{T}(undef, xmax + 1)
     @inbounds for x in 0:xmax
         total = zero(T)
@@ -275,10 +372,41 @@ function _nll_gp1_transitions(lambda::Real, alpha::Real, eta::Real,
         end
         return sum(parts)
     end
+    isempty(transitions) && return zero(T)
+    # Serial path: tabulate g(r | y) once per (y, r) and the innovation pmf once
+    # per count instead of once per transition. Same factors and the same
+    # summation order as compute_convolution_x_r_y, so the result is identical.
+    xmax, ymax = 0, 0
+    for (x, y) in transitions
+        xmax, ymax = max(xmax, x), max(ymax, y)
+    end
+    need = zeros(Int, ymax + 1)
+    for (x, y) in transitions
+        need[y + 1] = max(need[y + 1], min(x, y) + 1)
+    end
+    offsets = Vector{Int}(undef, ymax + 1)
+    len = 0
+    for y in 0:ymax
+        offsets[y + 1] = len
+        len += need[y + 1]
+    end
+    g = Vector{T}(undef, len)
+    for y in 0:ymax, r in 0:(need[y + 1] - 1)
+        g[offsets[y + 1] + r + 1] = compute_g_r_y(y, r, alpha, eta, lambda)
+    end
+    innovation = Vector{promote_type(typeof(lambda), typeof(eta))}(undef, xmax + 1)
+    for i in 0:xmax
+        innovation[i + 1] = generalized_poisson_distribution(i, lambda, eta)
+    end
     total = zero(T)
-    for i in eachindex(transitions)
+    @inbounds for i in eachindex(transitions)
         x, y = transitions[i]
-        total -= counts[i] * log(compute_convolution_x_r_y(x, y, lambda, alpha, eta))
+        offset = offsets[y + 1]
+        convolution = zero(T)
+        for r in 0:min(x, y)
+            convolution += g[offset + r + 1] * innovation[x - r + 1]
+        end
+        total -= counts[i] * log(convolution)
     end
     return total
 end
@@ -319,14 +447,13 @@ function _group_transitions(transitions::Vector{NTuple{3, Int}}, counts::Vector{
 end
 
 function _nll_gp2_group(kernel::GP2Kernel{T}, group::_GP2TransitionGroup, max_loop,
+        h::Vector{T}, base::Vector{Int},
         g_buffer::Vector{T} = Vector{T}(undef, group.rmax + 1)) where {T}
     smax = max_loop === nothing ? group.y : Int(max_loop)
     normalizer = bivariate_generalized_poisson(group.y, group.z, kernel.lambda,
         kernel.alpha1, kernel.alpha2, kernel.alpha3, kernel.eta)
-    @inbounds for r in 0:(group.rmax)
-        g_buffer[r + 1] = compute_g_r_y_z(kernel, r, group.y, group.z, normalizer,
-            smax)
-    end
+    _gp2_g_vector!(g_buffer, kernel, h, base, group.y, group.z, group.rmax,
+        normalizer, smax)
     total = zero(T)
     @inbounds for (x, count) in zip(group.xs, group.counts)
         convolution = zero(T)
@@ -338,21 +465,59 @@ function _nll_gp2_group(kernel::GP2Kernel{T}, group::_GP2TransitionGroup, max_lo
     return total
 end
 
+"""
+    _gp2_shared_h_table(kernel, groups, max_loop)
+
+One inner-sum table `H(a, b)` (see [`_gp2_h_cell`](@ref)) shared by all
+groups. With `max_loop === nothing` the per-group cap `smax = y` never binds
+because only `b <= y` is read, and otherwise the cap `max_loop` is the same
+for all groups, so one table serves every group. Column `b` stores only the
+hull of the `a` ranges `max(0, z - rmax):z` of the groups with `y >= b`
+(compact storage, so a single large count does not create a large dense
+table). Returns `(h, base)` with `H(a, b) = h[base[b + 1] + a + 1]`.
+"""
+function _gp2_shared_h_table(kernel::GP2Kernel{T}, groups::Vector{_GP2TransitionGroup},
+        max_loop) where {T}
+    bmax = maximum(group -> group.y, groups)
+    lo = fill(typemax(Int), bmax + 1)
+    hi = fill(-1, bmax + 1)
+    for group in groups
+        a_lo = max(0, group.z - group.rmax)
+        for b in 0:(group.y)
+            lo[b + 1] = min(lo[b + 1], a_lo)
+            hi[b + 1] = max(hi[b + 1], group.z)
+        end
+    end
+    base = Vector{Int}(undef, bmax + 1)
+    len = 0
+    for b in 0:bmax
+        base[b + 1] = len - lo[b + 1]
+        len += hi[b + 1] - lo[b + 1] + 1
+    end
+    cap = max_loop === nothing ? typemax(Int) : Int(max_loop)
+    h = Vector{T}(undef, len)
+    @inbounds for b in 0:bmax, a in lo[b + 1]:hi[b + 1]
+        h[base[b + 1] + a + 1] = _gp2_h_cell(kernel, a, b, cap)
+    end
+    return h, base
+end
+
 function _nll_gp2_transitions(lambda::Real, alpha1::Real, alpha2::Real, alpha3::Real,
         eta::Real, groups::Vector{_GP2TransitionGroup}, max_index::Integer, max_loop)
     kernel = GP2Kernel(lambda, alpha1, alpha2, alpha3, eta, max_index)
     T = eltype(kernel.gp_lambda)
+    h, base = _gp2_shared_h_table(kernel, groups, max_loop)
     if nthreads() > 1 && length(groups) > 16
         parts = Vector{T}(undef, length(groups))
         @threads for i in eachindex(groups)
-            parts[i] = _nll_gp2_group(kernel, groups[i], max_loop)
+            parts[i] = _nll_gp2_group(kernel, groups[i], max_loop, h, base)
         end
         return sum(parts)
     end
     total = zero(T)
     g_buffer = Vector{T}(undef, maximum(group -> group.rmax, groups) + 1)
     for group in groups
-        total += _nll_gp2_group(kernel, group, max_loop, g_buffer)
+        total += _nll_gp2_group(kernel, group, max_loop, h, base, g_buffer)
     end
     return total
 end
@@ -446,10 +611,17 @@ function compute_negative_log_likelihood_GP2(lambdas::AbstractVector, alpha1::Re
         end
         return sum(parts)
     end
+    # Serial path: reuse the kernel tables and the g / H buffers across t.
+    S = promote_type(eltype(lambdas), typeof(alpha1), typeof(alpha2), typeof(alpha3),
+        typeof(eta))
+    tables = (S[], S[], S[], S[], S[])
+    g, h = S[], S[]
     total = zero(T)
     for t in 3:n
-        total += _gp2_nll_term(lambdas[t], alpha1, alpha2, alpha3, eta, Int(data[t]),
-            Int(data[t - 1]), Int(data[t - 2]), max_loop)
+        x, y, z = Int(data[t]), Int(data[t - 1]), Int(data[t - 2])
+        kernel = _gp2_kernel!(tables, lambdas[t], alpha1, alpha2, alpha3, eta,
+            max(x, y + z))
+        total -= log(_convolution_x_r_y_z!(g, h, kernel, x, y, z, max_loop))
     end
     return total
 end
