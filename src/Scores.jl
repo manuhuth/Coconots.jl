@@ -114,7 +114,9 @@ end
 
 Non-randomized Probability Integral Transform histogram of a fitted model
 (Czado et al., 2009). Each observation's cumulative transition probabilities
-are obtained from a single pmf pass. Returns a `Dict` with keys
+are obtained from a single pmf pass. The PIT uses every observation with a
+full history, `t = order + 1, ..., n`, and is the mean over these `n - order`
+time points (as coconots' `cocoPit`). Returns a `Dict` with keys
 `"Pit_values"` and `"bins"`.
 """
 function cocoPit(cocoReg_fit, n_bins = 21)
@@ -157,10 +159,13 @@ end
     get_pit_value(Px, Pxm1, u)
 
 Mean of the conditional PIT at threshold `u` given the cumulative
-probabilities at (`Px`) and just below (`Pxm1`) each observation.
+probabilities at (`Px`) and just below (`Pxm1`) each observation. As in
+coconots' `cocoPit`, an undefined ratio (`0 / 0`, zero predictive mass at the
+observation) counts as `1`.
 """
 function get_pit_value(Px, Pxm1, u)
     value = (u .- Pxm1) ./ (Px .- Pxm1)
+    value[isnan.(value)] .= 1
     value[value .< 0] .= 0
     value[value .> 1] .= 1
     return mean(value)

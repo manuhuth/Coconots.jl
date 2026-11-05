@@ -174,28 +174,57 @@ end
 """
     compute_starting_values_GP2_reparameterized(type, data)
 
-Data-driven starting values for second-order models on the reparameterized
-scale: `[2*alpha1 + alpha3, alpha3 / (2*alpha1 + alpha3),
+Default starting values of second-order models without covariates, equal to
+the default start of coconots' `cocoReg` (`cocoReg_base.R` at the `cocoReg`
+defaults `seasonality = c(1, 2)`, `start.val.adjust = TRUE`,
+`replace.start.val = 1e-5`, `iteration.start.val = 0.6`):
+
+- `acf(k)`: sample autocorrelation as in `stats::acf` / `forecast::Acf`
+  (demeaned, both sums divided by `n`);
+- `eta = 1 - (mean / var)^0.5` (GP; `0` for Poisson), set to `1e-5` if
+  negative and to `1 - 1e-5` if above one;
+- `alpha3 = mu111 (1 - eta)^4 / (mean (1 + 2 eta))` with
+  `mu111 = sum_{t >= 3} (x_t - mean)(x_{t-1} - mean)(x_{t-2} - mean) / n`, set
+  to `1e-5` if negative and to `1 - 1e-5` if above one;
+- `alpha2 = acf(2) - alpha3`, `alpha1 = acf(1) - alpha3`, set to `1e-5` if
+  negative (`alpha2` to `1 - 1e-5` if above one);
+- all three alphas are multiplied by `shrink` while
+  `alpha1 + alpha2 + alpha3 > 1`, then `alpha1` and `alpha3` while
+  `2 alpha1 + alpha3 > 1`, with `shrink = 0.6` (Poisson,
+  `iteration.start.val`) and `shrink = 0.99` (GP, fixed in `cocoReg_base.R`);
+- `lambda = mean (1 - eta) (1 - alpha1 - alpha2 - alpha3)`, set to `1e-5` if
+  negative.
+
+Returned on the reparameterized scale in Julia ordering (lambda last):
+`[2*alpha1 + alpha3, alpha3 / (2*alpha1 + alpha3),
 alpha2 / (1 - alpha1 - alpha3)[, eta], lambda]`.
 """
 function compute_starting_values_GP2_reparameterized(type, data)
-    eta = type == "GP" ? compute_eta_starting_value(data) : 0.0
-    alpha3 = set_to_unit_interval(compute_mu_hat_gmm(data) / mean(data) /
-                                  (1 + 2 * eta) * (1 - eta)^4)
-    alpha1 = set_to_unit_interval(compute_autocorrelation(data, 1))
-    alpha2 = set_to_unit_interval(compute_autocorrelation(data, 2))
-
-    while alpha3 + alpha2 + alpha1 >= 1
-        alpha3 *= 0.8
-        alpha2 *= 0.8
-        alpha1 *= 0.8
+    x = Float64.(data)
+    replace_value = 1e-5
+    shrink = type == "GP" ? 0.99 : 0.6
+    acf = autocor(x, [1, 2])
+    eta = type == "GP" ? compute_eta_starting_value(x) : 0.0
+    alpha3 = compute_mu_hat_gmm(x) * (1 - eta)^4 / (mean(x) * (1 + 2 * eta))
+    alpha3 < 0 && (alpha3 = replace_value)
+    alpha3 > 1 && (alpha3 = 1 - replace_value)
+    alpha2 = acf[2] - alpha3
+    alpha2 < 0 && (alpha2 = replace_value)
+    alpha2 > 1 && (alpha2 = 1 - replace_value)
+    alpha1 = acf[1] - alpha3
+    alpha1 < 0 && (alpha1 = replace_value)
+    while alpha1 + alpha2 + alpha3 > 1
+        alpha1 *= shrink
+        alpha2 *= shrink
+        alpha3 *= shrink
     end
-    while alpha3 + 2 * alpha1 >= 1
-        alpha3 *= 0.8
-        alpha1 *= 0.8
+    while 2 * alpha1 + alpha3 > 1
+        alpha1 *= shrink
+        alpha3 *= shrink
     end
 
-    lambda = mean(data) * (1 - alpha1 - alpha2 - alpha3) * (1 - eta)
+    lambda = mean(x) * (1 - eta) * (1 - alpha1 - alpha2 - alpha3)
+    lambda < 0 && (lambda = replace_value)
 
     reparameterized = [2 * alpha1 + alpha3, alpha3 / (2 * alpha1 + alpha3),
         alpha2 / (1 - alpha1 - alpha3)]
@@ -208,13 +237,22 @@ end
 """
     compute_starting_values_GP1(type, data)
 
-Data-driven starting values for first-order models: `[alpha[, eta], lambda]`.
+Default starting values of first-order models without covariates, equal to
+the default start of coconots' `cocoReg` (`cocoReg_base.R`): `alpha = acf(1)`
+(as in `stats::acf`), set to `1e-5` if negative; `eta` as in
+[`compute_eta_starting_value`](@ref) (GP); `lambda = mean (1 - eta) (1 - alpha)`,
+set to `1e-5` if negative. Returns `[alpha[, eta], lambda]` (lambda last).
 """
 function compute_starting_values_GP1(type, data)
-    alpha = abs(compute_autocorrelation(data, 1))
-    lambda = mean(data) * (1 - alpha)
+    x = Float64.(data)
+    replace_value = 1e-5
+    alpha = autocor(x, [1])[1]
+    alpha < 0 && (alpha = replace_value)
+    eta = type == "GP" ? compute_eta_starting_value(x) : 0.0
+    lambda = mean(x) * (1 - eta) * (1 - alpha)
+    lambda < 0 && (lambda = replace_value)
     if type == "GP"
-        return [alpha, compute_eta_starting_value(data), lambda]
+        return [alpha, eta, lambda]
     end
     return [alpha, lambda]
 end
@@ -222,9 +260,13 @@ end
 """
     compute_eta_starting_value(data)
 
-Dispersion starting value `1 - sqrt(mean / var)`, floored at `0.0001`.
+Dispersion starting value `1 - (mean / var)^0.5` of coconots' `cocoReg`, set
+to `1e-5` if negative and to `1 - 1e-5` if above one.
 """
 function compute_eta_starting_value(data)
-    eta = 1 - sqrt(mean(data) / var(data))
-    return eta < 0 ? 0.0001 : eta
+    x = Float64.(data)
+    eta = 1 - (mean(x) / var(x))^0.5
+    eta < 0 && (eta = 1e-5)
+    eta > 1 && (eta = 1 - 1e-5)
+    return eta
 end
