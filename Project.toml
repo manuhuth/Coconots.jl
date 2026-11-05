@@ -1,6 +1,6 @@
 name = "Coconots"
 uuid = "2061d889-07fc-48e0-ab41-7cc4d945d6d4"
-version = "0.3.0"
+version = "0.2.0"
 authors = ["Manuel Huth", "Robert C. Jung", "Andy Tremayne"]
 
 [deps]
