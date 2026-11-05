@@ -40,6 +40,25 @@ above `MAX_FACTORIAL_ARGUMENT` (`F(170) < u` in the inversion).
 end
 
 """
+    _gp_inversion_pmf(i, lambda, eta)
+
+Generalized Poisson pmf at `i` for the inversion samplers: the direct pmf
+[`generalized_poisson_distribution`](@ref), or its log-space evaluation when the
+direct expression is not finite. For large rates the factor
+`(lambda + i * eta)^(i - 1)` overflows to `Inf` before `i` reaches 170 (e.g.
+`lambda = 300`, `eta = 0` from `i = 126` on); the accumulated cdf then jumped to
+`Inf` (or `NaN` when `exp(-lambda)` underflows to 0), ended the inversion at a
+draw below 170, and the count-limit error was never raised. The C++ backend
+(`hmmpa_dgenpois`, a product of ratios) does not overflow there. Wherever the
+direct pmf is finite the value is unchanged, so those draws are unchanged.
+"""
+@inline function _gp_inversion_pmf(i::Integer, lambda::Real, eta::Real)
+    p = generalized_poisson_distribution(i, lambda, eta)
+    isfinite(p) && return p
+    return exp(log_generalized_poisson_pdf(i, lambda, eta))
+end
+
+"""
     draw_random_generalized_poisson_variable(u, lambda, eta)
 
 Draws from the Generalized Poisson distribution by inverse-transform sampling
@@ -53,7 +72,7 @@ function draw_random_generalized_poisson_variable(u::Real, lambda::Real, eta::Re
         # F(i) < u: the draw is above i
         i >= MAX_FACTORIAL_ARGUMENT && _gp_count_limit_error(lambda, eta)
         i += 1
-        next = cumulative + generalized_poisson_distribution(i, lambda, eta)
+        next = cumulative + _gp_inversion_pmf(i, lambda, eta)
         if next < u && _gp_inversion_stop(cumulative, next)
             return i
         end
@@ -260,7 +279,7 @@ function _extend_innovation_cdf!(s::_TransitionSampler, new_length::Int)
     k = length(cdf)
     total = k == 0 ? 0.0 : cdf[k]
     for i in k:(new_length - 1)
-        total += generalized_poisson_distribution(i, s.lambda, s.eta)
+        total += _gp_inversion_pmf(i, s.lambda, s.eta)
         push!(cdf, total)
     end
     return cdf
