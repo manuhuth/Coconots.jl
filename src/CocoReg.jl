@@ -140,6 +140,32 @@ function minimize_pars_reparameterization_Poisson2(theta, data, covariates = not
         Int.(data), max_loop)
 end
 
+"""
+    _solve_default_with_fallback(problem, optimizer, allow_fallback; solve_kwargs...)
+
+Solves `problem` with `optimizer`. With `allow_fallback` (the default
+optimizer `LBFGS()`, Hager-Zhang line search), a run that throws, e.g. when
+the line search reaches a non-finite objective or gradient inside its
+bracket, or that ends at a non-finite objective is repeated from the same
+start with `LBFGS` and a backtracking line search, which halves the step
+until the objective is finite.
+"""
+function _solve_default_with_fallback(problem, optimizer, allow_fallback::Bool;
+        solve_kwargs...)
+    allow_fallback || return solve(problem, optimizer; solve_kwargs...)
+    solution = try
+        solve(problem, optimizer; solve_kwargs...)
+    catch err
+        err isa InterruptException && rethrow()
+        nothing
+    end
+    if solution !== nothing && isfinite(solution.objective)
+        return solution
+    end
+    return solve(problem, LBFGS(linesearch = LineSearches.BackTracking());
+        solve_kwargs...)
+end
+
 _logistic(u::Real) = 1 / (1 + exp(-u))
 _logit(x::Real) = log(x) - log1p(-x)
 
@@ -239,13 +265,15 @@ function cocoReg(type, order, data, covariates = nothing, starting_values = noth
         solution = solve(problem, optimizer; solve_kwargs...)
         parameter = copy(solution.u)
     else
-        optimizer = optimizer === nothing ? LBFGS() : optimizer
+        default_optimizer = optimizer === nothing
+        optimizer = default_optimizer ? LBFGS() : optimizer
         lo, hi = Float64.(lower), Float64.(upper)
         u0 = _to_unconstrained.(Float64.(starting_values), lo, hi)
         optimization_function = OptimizationFunction(
             (u, _) -> objective(_to_bounded.(u, lo, hi)), adtype)
         problem = OptimizationProblem(optimization_function, u0)
-        solution = solve(problem, optimizer; solve_kwargs...)
+        solution = _solve_default_with_fallback(problem, optimizer, default_optimizer;
+            solve_kwargs...)
         parameter = _to_bounded.(solution.u, lo, hi)
     end
 

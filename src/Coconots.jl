@@ -10,7 +10,7 @@ using SpecialFunctions: logfactorial
 using ForwardDiff
 using Optimization
 using OptimizationOptimJL
-using Optim: Fminbox, LBFGS, NelderMead
+using Optim: Fminbox, LBFGS, LineSearches, NelderMead
 using Base.Threads: @threads, nthreads
 
 include("Utils.jl")
