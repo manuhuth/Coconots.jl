@@ -207,6 +207,71 @@ function _to_unconstrained(x::Real, lower::Real, upper::Real)
 end
 
 """
+    _pull_inside(x, lower, upper, margin)
+
+Moves `x` at least `margin` (relative to the width for two-sided bounds,
+absolute for one-sided bounds) inside its bounds.
+"""
+function _pull_inside(x::Real, lower::Real, upper::Real, margin::Real)
+    if isfinite(lower) && isfinite(upper)
+        width = (upper - lower) * margin
+        return clamp(x, lower + width, upper - width)
+    elseif isfinite(lower)
+        return max(x, lower + margin)
+    elseif isfinite(upper)
+        return min(x, upper - margin)
+    end
+    return x
+end
+
+const _RESTART_MARGIN = 1e-4
+const _MAX_RESTARTS = 3
+
+"""
+    _restart_near_bounds(solution, optimization_function, optimizer, allow_fallback,
+                         lo, hi; solve_kwargs...)
+
+Restarts the unconstrained solve from its solution (at most `_MAX_RESTARTS`
+times). On the transformed scale the gradient of a coordinate vanishes as it
+approaches its bound, so a solve can stop at a bound although the optimum is
+interior (the coordinate cannot move back), or stall near a bound while the
+objective still decreases. The first restart therefore starts from the
+solution with every coordinate within `_RESTART_MARGIN` of a bound moved that
+far inside; later restarts start from the current solution as it is, with
+fresh curvature memory, and stop once the objective no longer decreases by
+more than `1e-10`. A restart is kept only if it lowers the objective. At an
+interior stationary point a restart stops at its first gradient check.
+Restarts use [`_solve_default_with_fallback`](@ref) with `allow_fallback`; a
+restart that still throws ends the restarts and keeps the current solution.
+"""
+function _restart_near_bounds(solution, optimization_function, optimizer,
+        allow_fallback::Bool, lo, hi; solve_kwargs...)
+    for k in 1:_MAX_RESTARTS
+        u_restart = copy(solution.u)
+        if k == 1
+            x = _to_bounded.(solution.u, lo, hi)
+            u_restart = _to_unconstrained.(_pull_inside.(x, lo, hi, _RESTART_MARGIN),
+                lo, hi)
+        end
+        restart = try
+            _solve_default_with_fallback(
+                OptimizationProblem(optimization_function, u_restart), optimizer,
+                allow_fallback; solve_kwargs...)
+        catch err
+            err isa InterruptException && rethrow()
+            nothing
+        end
+        restart === nothing && break
+        improvement = isfinite(solution.objective) ?
+                      solution.objective - restart.objective :
+                      (isfinite(restart.objective) ? Inf : 0.0)
+        improvement > 0 && (solution = restart)
+        k > 1 && !(improvement > 1e-10) && break
+    end
+    return solution
+end
+
+"""
     cocoReg(type, order, data, covariates=nothing, starting_values=nothing,
             link_function="log", lower_bound_covariates=-Inf, max_loop=nothing,
             optimizer=nothing; adtype=Optimization.AutoForwardDiff(),
@@ -274,6 +339,8 @@ function cocoReg(type, order, data, covariates = nothing, starting_values = noth
         problem = OptimizationProblem(optimization_function, u0)
         solution = _solve_default_with_fallback(problem, optimizer, default_optimizer;
             solve_kwargs...)
+        solution = _restart_near_bounds(solution, optimization_function, optimizer,
+            default_optimizer, lo, hi; solve_kwargs...)
         parameter = _to_bounded.(solution.u, lo, hi)
     end
 
