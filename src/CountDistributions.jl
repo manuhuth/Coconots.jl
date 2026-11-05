@@ -24,20 +24,6 @@ of the direct pmf whenever factorials would overflow.
 end
 
 """
-    poisson_distribution(x, lambda)
-
-Probability mass function of the Poisson distribution at count `x` with rate
-`lambda`.
-"""
-function poisson_distribution(x::Real, lambda::Real)
-    xi = Int(x)
-    if xi <= MAX_FACTORIAL_ARGUMENT
-        return exp(-lambda) * lambda^xi / float_factorial(xi)
-    end
-    return exp(xi * log(lambda) - lambda - logfactorial(xi))
-end
-
-"""
     generalized_poisson_distribution(x, lambda, eta)
 
 Probability mass function of the Generalized Poisson distribution at count `x`
