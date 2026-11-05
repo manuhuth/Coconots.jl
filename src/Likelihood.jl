@@ -192,27 +192,165 @@ evaluation of identical inner sums.
     return acc
 end
 
+#--------------------------------------------------------------------------------------
+# Factored evaluation of g(r | y, z)
+#
+# With the kernel tables P1 = gp_beta1, P2 = gp_beta2, P3 = gp_beta3 and the inner
+# sums H(a, b) (see `_gp2_h_cell`), the sum of `compute_g_r_y_z` is
+#
+#   N g(r) = sum_{s, v} P3(s) P1(v) P2(r - s - v) H(z - r + v, y - s - v)
+#
+# over the feasible set F(r) = {s, v >= 0 : s <= smax, v <= smax, s + v <= r,
+# s + v <= y, v >= r - z} (u = r - s - v >= 0 indexes P2, a = z - r + v >= 0 and
+# b = y - s - v >= 0 index H; s <= r and s <= y follow from v >= 0). Substituting
+# t = r - v (so u = t - s and a = z - t) gives, for every r in 0:rmax,
+#
+#   N g(r) = sum_{v = max(0, r - z)}^{min(smax, r, y)} P1(v) *
+#            sum_{s = 0}^{min(smax, t, y - v)} C(t, s) H(z - t, y - v - s),  t = r - v,
+#
+# with C(t, s) = P3(s) P2(t - s): the constraints v >= r - z <=> t <= z, v <= r <=>
+# t >= 0, s <= t <=> u >= 0, s <= y - v <=> b >= 0, so (r, s, v) <-> (r, v, s) is a
+# bijection of F(r). C does not depend on r, so it is tabulated once (rows
+# t in 0:min(z, rmax), row t holding s in 0:S_t with S_t >= min(t, smax, y)), and
+# each term of the triple sum costs one multiplication instead of three. The inner
+# sum of H is factored the same way (see `_gp2_h_column!`).
+#
+# Exact-zero trimming: every row of C (and every column factor E of H) stores the
+# first and last index whose entry is not exactly zero (`iszero`, i.e. value and all
+# partials, recursively for nested Duals). Entries outside that range are exactly
+# zero and are skipped: their product with a finite factor is +-0 in every
+# component, and adding +-0 to an accumulator that starts at +0 never changes it
+# (an IEEE sum is -0 only if both summands are -0). The result is therefore the
+# same bits as summing all terms in the same order. This removes the subnormal and
+# zero arithmetic of the long tails of pmf tables at tiny rates (e.g. beta2, beta3
+# of a second-order fit to first-order data).
+#--------------------------------------------------------------------------------------
+
 """
-    _gp2_g_vector!(g, kernel, h, base, y, z, rmax, normalizer, smax)
+    _GP2CTable
+
+Products `C(t, s) = P_beta3(s) P_beta2(t - s)` stored as
+`C(t, s) = c[base[t + 1] + s + 1]`. Row `t` is nonzero (exactly) at most on
+`lo[t + 1]:hi[t + 1]` (empty if `hi < lo`), a subrange of `0:min(t, S_t)` where
+`S_t` is the last stored index of row `t`.
+"""
+struct _GP2CTable{T, B <: AbstractVector{Int}}
+    c::Vector{T}
+    base::B
+    lo::Vector{Int}
+    hi::Vector{Int}
+end
+
+"""
+    _gp2_c_row!(c, off, kernel, t, smax_t)
+
+Writes `C(t, s) = P_beta3(s) P_beta2(t - s)` into `c[off + s + 1]` for
+`s in 0:smax_t` (`smax_t <= t`; nothing if `smax_t < 0`) and returns `(lo, hi)`,
+the first and last `s` with `C(t, s)` not exactly zero (`(0, -1)` if none).
+"""
+@inline function _gp2_c_row!(c::Vector{T}, off::Int, kernel::GP2Kernel{T}, t::Int,
+        smax_t::Int) where {T}
+    lo, hi = 0, -1
+    @inbounds for s in 0:smax_t
+        cs = kernel.gp_beta3[s + 1] * kernel.gp_beta2[t - s + 1]
+        c[off + s + 1] = cs
+        if !iszero(cs)
+            hi < 0 && (lo = s)
+            hi = s
+        end
+    end
+    return lo, hi
+end
+
+"""
+    _gp2_c_block!(c, lo, hi, kernel, y, z, rmax, smax)
+
+[`_GP2CTable`](@ref) for one `(y, z)` history in the caller-owned buffers
+(grown if needed): rows `t in 0:min(z, rmax)`, each of width
+`max(min(smax, y), 0) + 1` and filled on `s in 0:min(t, smax, y)`. Reads
+`gp_beta3[0:min(y, rmax)]` and `gp_beta2[0:rmax]` only.
+"""
+function _gp2_c_block!(c::Vector{T}, lo::Vector{Int}, hi::Vector{Int},
+        kernel::GP2Kernel{T}, y::Int, z::Int, rmax::Int, smax::Int) where {T}
+    tmax = min(z, rmax)
+    sw = min(smax, y)
+    width = max(sw, 0) + 1
+    length(c) < (tmax + 1) * width && resize!(c, (tmax + 1) * width)
+    length(lo) < tmax + 1 && resize!(lo, tmax + 1)
+    length(hi) < tmax + 1 && resize!(hi, tmax + 1)
+    for t in 0:tmax
+        l, u = _gp2_c_row!(c, t * width, kernel, t, min(t, sw))
+        @inbounds lo[t + 1] = l
+        @inbounds hi[t + 1] = u
+    end
+    return _GP2CTable(c, range(0; step = width, length = tmax + 1), lo, hi)
+end
+
+"""
+    _gp2_h_column!(h, off, e, kernel, b, a_lo, a_hi, cap)
+
+Writes `H(a, b)` (see [`_gp2_h_cell`](@ref)) into `h[off + a + 1]` for
+`a in a_lo:a_hi` (`a_lo >= 0`). The factor `E(w) = P_beta1(w) P_zeta(b - w)`
+does not depend on `a`, so it is tabulated once per column in the buffer `e`
+for `w in 0:wmax`, `wmax = min(cap, b, a_hi)`, and
+`H(a, b) = sum_{w = 0}^{min(wmax, a)} E(w) P_lambda(a - w)`, the same range as
+`min(cap, a, b)` in `_gp2_h_cell` because `a <= a_hi`. Leading and trailing
+exactly-zero `E(w)` are skipped (exact, see the note above `_GP2CTable`).
+"""
+function _gp2_h_column!(h::Vector{T}, off::Int, e::Vector{T}, kernel::GP2Kernel{T},
+        b::Int, a_lo::Int, a_hi::Int, cap::Int) where {T}
+    wmax = min(cap, b, a_hi)
+    length(e) < wmax + 1 && resize!(e, wmax + 1)
+    wlo, whi = 0, -1
+    @inbounds for w in 0:wmax
+        ew = kernel.gp_beta1[w + 1] * kernel.gp_zeta[b - w + 1]
+        e[w + 1] = ew
+        if !iszero(ew)
+            whi < 0 && (wlo = w)
+            whi = w
+        end
+    end
+    @inbounds for a in a_lo:a_hi
+        acc = zero(T)
+        for w in wlo:min(whi, a)
+            acc += e[w + 1] * kernel.gp_lambda[a - w + 1]
+        end
+        h[off + a + 1] = acc
+    end
+    return h
+end
+
+"""
+    _gp2_g_vector!(g, kernel, h, base, ct, y, z, rmax, normalizer, smax)
 
 Writes `g(r | y, z)` for `r = 0, ..., rmax` into `g[1:rmax+1]`, reading the
-inner sums `H(a, b)` (see [`_gp2_h_cell`](@ref)) from `h[base[b + 1] + a + 1]`.
-The table must cover `a in max(0, z - rmax):z` for every `b in 0:y`, with a
-`cap` that is equivalent to `smax` on `b <= y`. Same sum as
-[`compute_g_r_y_z`](@ref); the `v` range starts at `max(0, r - z)` because
-smaller `v` have an empty `w` range there.
+inner sums `H(a, b)` (see [`_gp2_h_cell`](@ref)) from `h[base[b + 1] + a + 1]`
+and the products `C(t, s)` from the [`_GP2CTable`](@ref) `ct`. The H table
+must cover `a in max(0, z - rmax):z` for every `b in 0:y`, with a `cap` that is
+equivalent to `smax` on `b <= y`; `ct` must cover rows `t in 0:min(z, rmax)`
+with `S_t >= min(t, smax, y)`. Same sum as [`compute_g_r_y_z`](@ref), factored
+as in the note above `_GP2CTable` (equal up to rounding).
 """
 function _gp2_g_vector!(g::AbstractVector{T}, kernel::GP2Kernel{T}, h::Vector{T},
-        base::AbstractVector{Int}, y::Int, z::Int, rmax::Int, normalizer::Real,
-        smax::Int) where {T}
+        base::AbstractVector{Int}, ct::_GP2CTable{T}, y::Int, z::Int, rmax::Int,
+        normalizer::Real, smax::Int) where {T}
+    c, cbase, clo, chi = ct.c, ct.base, ct.lo, ct.hi
+    p1 = kernel.gp_beta1
     @inbounds for r in 0:rmax
         total = zero(T)
-        for s in 0:min(smax, r, y)
-            ps = kernel.gp_beta3[s + 1]
-            for v in max(0, r - z):min(smax, r - s, y - s)
-                total += ps * kernel.gp_beta1[v + 1] * kernel.gp_beta2[r - s - v + 1] *
-                         h[base[y - s - v + 1] + z - r + v + 1]
+        for v in max(0, r - z):min(smax, r, y)
+            t = r - v               # 0 <= t <= min(z, rmax)
+            a1 = z - t + 1          # a + 1 with a = z - r + v >= 0
+            bv = y - v + 1          # b + 1 = bv - s with b = y - v - s >= 0
+            co = cbase[t + 1] + 1   # C(t, s) = c[co + s]
+            shi = min(chi[t + 1], smax, y - v)
+            slo = clo[t + 1]
+            slo > shi && continue   # every term of this v is exactly zero
+            acc = zero(T)
+            for s in slo:shi
+                acc += c[co + s] * h[base[bv - s] + a1]
             end
+            total += p1[v + 1] * acc
         end
         g[r + 1] = total / normalizer
     end
@@ -222,10 +360,10 @@ end
 """
     _gp2_g_vector!(g, h, kernel, y, z, rmax, max_loop)
 
-Stand-alone version for one `(y, z)` history: computes the normalizer and the
+Stand-alone version for one `(y, z)` history: computes the normalizer, the
 needed block `a in max(0, z - rmax):z`, `b in 0:y` of the inner-sum table in
-the caller-owned buffers `g` and `h` (resized if needed) and returns `g`
-holding `g(r | y, z)` for `r = 0, ..., rmax`.
+the caller-owned buffer `h` and the products `C(t, s)` (both resized if
+needed) and returns `g` holding `g(r | y, z)` for `r = 0, ..., rmax`.
 """
 function _gp2_g_vector!(g::Vector{T}, h::Vector{T}, kernel::GP2Kernel{T}, y::Int,
         z::Int, rmax::Int, max_loop) where {T}
@@ -234,25 +372,28 @@ function _gp2_g_vector!(g::Vector{T}, h::Vector{T}, kernel::GP2Kernel{T}, y::Int
     normalizer = bivariate_generalized_poisson(y, z, kernel.lambda, kernel.alpha1,
         kernel.alpha2, kernel.alpha3, kernel.eta)
     length(g) < rmax + 1 && resize!(g, rmax + 1)
-    base = _gp2_h_block!(h, kernel, y, z, rmax, smax)
-    return _gp2_g_vector!(g, kernel, h, base, y, z, rmax, normalizer, smax)
+    base = _gp2_h_block!(h, T[], kernel, y, z, rmax, smax)
+    ct = _gp2_c_block!(T[], Int[], Int[], kernel, y, z, rmax, smax)
+    return _gp2_g_vector!(g, kernel, h, base, ct, y, z, rmax, normalizer, smax)
 end
 
 """
-    _gp2_h_block!(h, kernel, y, z, rmax, smax)
+    _gp2_h_block!(h, e, kernel, y, z, rmax, smax)
 
 Fills the block `a in max(0, z - rmax):z`, `b in 0:y` of the inner-sum table
 `H(a, b)` (see [`_gp2_h_cell`](@ref)) into the caller-owned buffer `h`
-(grown if needed) and returns `base` with `H(a, b) = h[base[b + 1] + a + 1]`.
-Reads `gp_beta1[0:y]`, `gp_lambda[0:z]` and `gp_zeta[0:y]` only.
+(grown if needed; `e` is scratch for [`_gp2_h_column!`](@ref)) and returns
+`base` with `H(a, b) = h[base[b + 1] + a + 1]`. Reads `gp_beta1[0:y]`,
+`gp_lambda[0:z]` and `gp_zeta[0:y]` only.
 """
-function _gp2_h_block!(h::Vector{T}, kernel::GP2Kernel{T}, y::Int, z::Int, rmax::Int,
-        smax::Int) where {T}
+function _gp2_h_block!(h::Vector{T}, e::Vector{T}, kernel::GP2Kernel{T}, y::Int, z::Int,
+        rmax::Int, smax::Int) where {T}
     a_lo = max(0, z - rmax)
     na = z - a_lo + 1
     length(h) < na * (y + 1) && resize!(h, na * (y + 1))
-    @inbounds for b in 0:y, a in a_lo:z
-        h[b * na + (a - a_lo) + 1] = _gp2_h_cell(kernel, a, b, smax)
+    for b in 0:y
+        # h[b * na + (a - a_lo) + 1] == h[(b * na - a_lo) + a + 1]
+        _gp2_h_column!(h, b * na - a_lo, e, kernel, b, a_lo, z, smax)
     end
     # h[b * na + (a - a_lo) + 1] == h[base[b + 1] + a + 1] with this base
     return range(-a_lo; step = na, length = y + 1)
@@ -460,12 +601,12 @@ function _group_transitions(transitions::Vector{NTuple{3, Int}}, counts::Vector{
 end
 
 function _nll_gp2_group(kernel::GP2Kernel{T}, group::_GP2TransitionGroup, max_loop,
-        h::Vector{T}, base::Vector{Int},
+        h::Vector{T}, base::Vector{Int}, ct::_GP2CTable{T},
         g_buffer::Vector{T} = Vector{T}(undef, group.rmax + 1)) where {T}
     smax = max_loop === nothing ? group.y : Int(max_loop)
     normalizer = bivariate_generalized_poisson(group.y, group.z, kernel.lambda,
         kernel.alpha1, kernel.alpha2, kernel.alpha3, kernel.eta)
-    _gp2_g_vector!(g_buffer, kernel, h, base, group.y, group.z, group.rmax,
+    _gp2_g_vector!(g_buffer, kernel, h, base, ct, group.y, group.z, group.rmax,
         normalizer, smax)
     total = zero(T)
     @inbounds for (x, count) in zip(group.xs, group.counts)
@@ -509,10 +650,50 @@ function _gp2_shared_h_table(kernel::GP2Kernel{T}, groups::Vector{_GP2Transition
     end
     cap = max_loop === nothing ? typemax(Int) : Int(max_loop)
     h = Vector{T}(undef, len)
-    @inbounds for b in 0:bmax, a in lo[b + 1]:hi[b + 1]
-        h[base[b + 1] + a + 1] = _gp2_h_cell(kernel, a, b, cap)
+    e = T[]
+    for b in 0:bmax
+        _gp2_h_column!(h, base[b + 1], e, kernel, b, lo[b + 1], hi[b + 1], cap)
     end
     return h, base
+end
+
+"""
+    _gp2_shared_c_table(kernel, groups, max_loop)
+
+One [`_GP2CTable`](@ref) of `C(t, s) = P_beta3(s) P_beta2(t - s)` shared by all
+groups (C depends on the parameters only). A group `(y, z, rmax)` with
+`smax = max_loop === nothing ? y : max_loop` reads rows `t in 0:min(z, rmax)`
+at `s in 0:min(t, smax, y)`, so row `t` stores `s in 0:S_t` with `S_t` the
+largest `min(t, smax, y)` over the groups that read row `t` (compact storage,
+as for the H table). Reads `gp_beta3` and `gp_beta2` on `0:max(min(z, rmax))`
+only (covered by the kernel's `max_index >= z`).
+"""
+function _gp2_shared_c_table(kernel::GP2Kernel{T}, groups::Vector{_GP2TransitionGroup},
+        max_loop) where {T}
+    tmax = maximum(group -> min(group.z, group.rmax), groups)
+    width = fill(-1, tmax + 1)   # S_t (-1: empty row)
+    for group in groups
+        smax = max_loop === nothing ? group.y : Int(max_loop)
+        sw = min(smax, group.y)
+        for t in 0:min(group.z, group.rmax)
+            width[t + 1] = max(width[t + 1], min(t, sw))
+        end
+    end
+    base = Vector{Int}(undef, tmax + 1)
+    len = 0
+    for t in 0:tmax
+        base[t + 1] = len
+        len += width[t + 1] + 1
+    end
+    c = Vector{T}(undef, len)
+    lo = Vector{Int}(undef, tmax + 1)
+    hi = Vector{Int}(undef, tmax + 1)
+    for t in 0:tmax
+        l, u = _gp2_c_row!(c, base[t + 1], kernel, t, width[t + 1])
+        lo[t + 1] = l
+        hi[t + 1] = u
+    end
+    return _GP2CTable(c, base, lo, hi)
 end
 
 function _nll_gp2_transitions(lambda::Real, alpha1::Real, alpha2::Real, alpha3::Real,
@@ -520,17 +701,18 @@ function _nll_gp2_transitions(lambda::Real, alpha1::Real, alpha2::Real, alpha3::
     kernel = GP2Kernel(lambda, alpha1, alpha2, alpha3, eta, max_index)
     T = eltype(kernel.gp_lambda)
     h, base = _gp2_shared_h_table(kernel, groups, max_loop)
+    ct = _gp2_shared_c_table(kernel, groups, max_loop)
     if nthreads() > 1 && length(groups) > 16
         parts = Vector{T}(undef, length(groups))
         @threads for i in eachindex(groups)
-            parts[i] = _nll_gp2_group(kernel, groups[i], max_loop, h, base)
+            parts[i] = _nll_gp2_group(kernel, groups[i], max_loop, h, base, ct)
         end
         return sum(parts)
     end
     total = zero(T)
     g_buffer = Vector{T}(undef, maximum(group -> group.rmax, groups) + 1)
     for group in groups
-        total += _nll_gp2_group(kernel, group, max_loop, h, base, g_buffer)
+        total += _nll_gp2_group(kernel, group, max_loop, h, base, ct, g_buffer)
     end
     return total
 end
@@ -734,7 +916,8 @@ function _nll_gp2_covariates_serial(lambdas::AbstractVector, alpha1::Real, alpha
     q = exp(-eta)
     exp_eta = exp(eta)
     tb1, tb2, tb3, tl, tz = S[], S[], S[], S[], S[]
-    g, h = S[], S[]
+    g, h, e, cbuf = S[], S[], S[], S[]
+    clo, chi = Int[], Int[]
     total = zero(S)
     for t in 3:n
         x, y, z = Int(data[t]), Int(data[t - 1]), Int(data[t - 2])
@@ -758,8 +941,9 @@ function _nll_gp2_covariates_serial(lambdas::AbstractVector, alpha1::Real, alpha
         end
         smax = max_loop === nothing ? y : Int(max_loop)
         length(g) < rmax + 1 && resize!(g, rmax + 1)
-        base = _gp2_h_block!(h, kernel, y, z, rmax, smax)
-        _gp2_g_vector!(g, kernel, h, base, y, z, rmax, normalizer, smax)
+        base = _gp2_h_block!(h, e, kernel, y, z, rmax, smax)
+        ct = _gp2_c_block!(cbuf, clo, chi, kernel, y, z, rmax, smax)
+        _gp2_g_vector!(g, kernel, h, base, ct, y, z, rmax, normalizer, smax)
         convolution = zero(S)
         @inbounds for r in 0:rmax
             convolution += g[r + 1] * tl[x - r + 1]

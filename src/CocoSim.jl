@@ -153,6 +153,13 @@ mutable struct _TransitionSampler
     h::Vector{Float64}
     h_amax::Int
     h_bmax::Int
+    # shared products C(t, s) = P_beta3(s) P_beta2(t - s) = c[t * (h_bmax + 1) + s + 1],
+    # t in 0:h_amax, s in 0:min(t, h_bmax), nonzero only on c_lo[t + 1]:c_hi[t + 1]
+    # (see `_GP2CTable`); built together with h
+    c::Vector{Float64}
+    c_lo::Vector{Int}
+    c_hi::Vector{Int}
+    ebuf::Vector{Float64}
     gbuf::Vector{Float64}
     hbuf::Vector{Float64}
     scratch::Vector{Float64}
@@ -164,7 +171,8 @@ function _TransitionSampler(order::Int, alpha::Float64, alpha1::Float64, alpha2:
     return _TransitionSampler(order, alpha, alpha1, alpha2, alpha3, eta, U, NaN,
         Float64[], zeros(Int, 0, 0), zeros(Int, 0, 0), 1, Float64[],
         (Float64[], Float64[], Float64[], Float64[], Float64[]), nothing, -1,
-        Float64[], -1, -1, Float64[], Float64[], Float64[])
+        Float64[], -1, -1, Float64[], Int[], Int[], Float64[], Float64[], Float64[],
+        Float64[])
 end
 
 """
@@ -264,8 +272,20 @@ function _prepare_order2_step!(s::_TransitionSampler, ymax::Int, zmax::Int)
     length(h) < na * (bmax + 1) && resize!(h, na * (bmax + 1))
     # cap = b: min(cap, a, b) = min(a, b), the untruncated inner sum, which is
     # what g(r | y, z) reads for every b <= y (s-range 0:y)
-    @inbounds for b in 0:bmax, a in 0:amax
-        h[b * na + a + 1] = _gp2_h_cell(kernel, a, b, b)
+    for b in 0:bmax
+        _gp2_h_column!(h, b * na, s.ebuf, kernel, b, 0, amax, b)
+    end
+    # C rows t in 0:amax (t <= min(z, upper) = z <= amax) of width bmax + 1, filled
+    # on s in 0:min(t, bmax), which covers min(t, smax, y) = min(t, y) for y <= bmax
+    nb = bmax + 1
+    c = s.c
+    length(c) < na * nb && resize!(c, na * nb)
+    length(s.c_lo) < na && resize!(s.c_lo, na)
+    length(s.c_hi) < na && resize!(s.c_hi, na)
+    for t in 0:amax
+        l, u = _gp2_c_row!(c, t * nb, kernel, t, min(t, bmax))
+        s.c_lo[t + 1] = l
+        s.c_hi[t + 1] = u
     end
     s.h_amax = amax
     s.h_bmax = bmax
@@ -314,7 +334,9 @@ function _g_cdf!(store::Vector{Float64}, offset::Int, s::_TransitionSampler, y::
         length(gbuf) < upper + 1 && resize!(gbuf, upper + 1)
         normalizer = _gp2_sampler_normalizer(s, y, z)
         base = range(0; step = s.h_amax + 1, length = y + 1)
-        g = _gp2_g_vector!(gbuf, kernel, s.h, base, y, z, upper, normalizer, y)
+        ct = _GP2CTable(s.c, range(0; step = s.h_bmax + 1, length = s.h_amax + 1),
+            s.c_lo, s.c_hi)
+        g = _gp2_g_vector!(gbuf, kernel, s.h, base, ct, y, z, upper, normalizer, y)
     else
         g = _gp2_g_vector!(s.gbuf, s.hbuf, kernel, y, z, upper, nothing)
     end
