@@ -173,6 +173,39 @@ end
     end
 end
 
+@testset "restart from bounds at which the objective decreases inward (KKT)" begin
+    # objective decreasing into the interior at the lower bound of x[1] only
+    f(x) = (x[1] - 0.3)^2 + (x[2] + 1.0)^2
+    lo, hi = [0.0, 0.0], [1.0, Inf]
+    @test Coconots._bound_kkt_violations(f, [1e-12, 1e-9], lo, hi) == [1]
+    @test isempty(Coconots._bound_kkt_violations(f, [0.3, 1e-9], lo, hi))
+    # at an upper bound: a violation iff the objective decreases downward
+    @test Coconots._bound_kkt_violations(x -> x[1], [1 - 1e-9, 2.0], lo, hi) == [1]
+    @test isempty(Coconots._bound_kkt_violations(x -> -x[1], [1 - 1e-9, 2.0], lo, hi))
+
+    # count series (benchmark problem PAR1_softplus_n200_s5) on which the GP2
+    # fit from the default start (the coconots start: alpha1 = alpha2 = 1e-5,
+    # alpha3 = 0.515) stalled with alpha2 at its bound 0 (loglik
+    # -468.538005) although the objective decreases in alpha2 there; the
+    # maximum is interior in alpha2 (loglik -468.524202)
+    data = [
+        6, 2, 7, 4, 4, 5, 4, 8, 7, 10, 11, 7, 6, 3, 8, 6, 6, 9, 6, 11, 12, 9, 6, 11,
+        13, 7, 9, 6, 5, 9, 7, 5, 8, 7, 5, 9, 7, 5, 8, 9, 10, 15, 10, 11, 7, 11, 6, 5,
+        10, 4, 6, 5, 5, 4, 10, 6, 8, 6, 12, 11, 12, 8, 9, 8, 10, 6, 8, 8, 8, 5, 6, 8,
+        12, 10, 12, 14, 6, 7, 4, 3, 6, 10, 9, 8, 12, 11, 6, 7, 6, 3, 6, 7, 7, 4, 8, 10,
+        10, 5, 6, 9, 9, 6, 4, 6, 9, 7, 8, 10, 9, 3, 7, 17, 11, 12, 7, 7, 10, 6, 7, 8,
+        14, 16, 16, 10, 14, 6, 6, 8, 7, 6, 10, 3, 9, 11, 9, 7, 7, 7, 7, 5, 7, 8, 3, 6,
+        7, 5, 6, 10, 6, 9, 6, 4, 6, 8, 9, 6, 8, 2, 6, 8, 8, 10, 13, 8, 8, 3, 10, 10, 9,
+        14, 12, 13, 9, 10, 10, 14, 8, 9, 13, 13, 8, 6, 7, 8, 7, 9, 9, 5, 6, 8, 7, 9, 5,
+        10, 5, 6, 2, 4, 7, 9]
+    fit = cocoReg("GP", 2, data)
+    @test fit["log_likelihood"] >= -468.524202241155 - 1e-6
+    @test isapprox(fit["parameter"][2], 0.0399690904; atol = 1e-4)
+    f_alpha = Coconots._make_objective("GP", 2, data, nothing, "log", nothing, false)
+    lo2, hi2 = Coconots.get_bounds(2, "GP", nothing, -Inf)
+    @test isempty(Coconots._bound_kkt_violations(f_alpha, fit["parameter"], lo2, hi2))
+end
+
 @testset "cocoReg with covariates" begin
     Random.seed!(21)
     n = 250

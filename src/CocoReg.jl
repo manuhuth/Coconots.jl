@@ -306,6 +306,86 @@ function _restart_near_bounds(solution, optimization_function, optimizer,
     return solution
 end
 
+const _KKT_INSIDE_MARGIN = 1e-2
+const _KKT_GRADIENT_TOL = 1e-6
+const _MAX_KKT_RESTARTS = 2
+
+"""
+    _bound_kkt_violations(objective, x, lo, hi)
+
+Coordinates of `x` (bounded scale of [`_to_bounded`](@ref)) that lie within
+`_RESTART_MARGIN` of a bound (relative to the width for two-sided bounds,
+absolute for one-sided bounds) although the objective decreases into the
+interior there: gradient below `-_KKT_GRADIENT_TOL` at a lower bound, above
+`_KKT_GRADIENT_TOL` at an upper bound. At a minimum on a bound the gradient
+points out of the box (Karush-Kuhn-Tucker condition); a violated coordinate
+is a point where the unconstrained solve stalled because the gradient on the
+transformed scale vanishes at the bound. Returns an empty vector if the
+gradient is not finite.
+"""
+function _bound_kkt_violations(objective, x, lo, hi)
+    g = try
+        ForwardDiff.gradient(objective, x)
+    catch err
+        err isa InterruptException && rethrow()
+        return Int[]
+    end
+    all(isfinite, g) || return Int[]
+    near_lower(i) = isfinite(lo[i]) &&
+                    x[i] - lo[i] <= _RESTART_MARGIN * (isfinite(hi[i]) ? hi[i] - lo[i] : 1.0)
+    near_upper(i) = isfinite(hi[i]) &&
+                    hi[i] - x[i] <= _RESTART_MARGIN * (isfinite(lo[i]) ? hi[i] - lo[i] : 1.0)
+    return [i for i in eachindex(x)
+            if (near_lower(i) && g[i] < -_KKT_GRADIENT_TOL) ||
+               (near_upper(i) && g[i] > _KKT_GRADIENT_TOL)]
+end
+
+"""
+    _restart_kkt_bounds(solution, objective, optimization_function, optimizer,
+                        allow_fallback, lo, hi; solve_kwargs...)
+
+Restarts the unconstrained solve (at most `_MAX_KKT_RESTARTS` times) while
+its solution has coordinates at a bound at which the objective still
+decreases into the interior ([`_bound_kkt_violations`](@ref)). Such a
+coordinate is moved `_KKT_INSIDE_MARGIN` inside its bound (relative to the
+width for two-sided bounds, absolute for one-sided bounds), the other
+coordinates are kept, and the problem is solved from there followed by
+[`_restart_near_bounds`](@ref). The near-bound restarts of
+[`_restart_near_bounds`](@ref) run before the solve has located the
+interior coordinates, so a coordinate can return to its bound and stall
+there; once the other coordinates are (near) optimal, the gradient at the
+bound tells whether the bound is optimal. A restart is kept only if it lowers
+the objective; a restart that throws ends the restarts.
+"""
+function _restart_kkt_bounds(solution, objective, optimization_function, optimizer,
+        allow_fallback::Bool, lo, hi; solve_kwargs...)
+    for _ in 1:_MAX_KKT_RESTARTS
+        isfinite(solution.objective) || break
+        x = _to_bounded.(solution.u, lo, hi)
+        violated = _bound_kkt_violations(objective, x, lo, hi)
+        isempty(violated) && break
+        x_restart = copy(x)
+        for i in violated
+            x_restart[i] = _pull_inside(x[i], lo[i], hi[i], _KKT_INSIDE_MARGIN)
+        end
+        restart = try
+            r = _solve_default_with_fallback(
+                OptimizationProblem(optimization_function,
+                    _to_unconstrained.(x_restart, lo, hi)), optimizer, allow_fallback;
+                solve_kwargs...)
+            _restart_near_bounds(r, optimization_function, optimizer, allow_fallback,
+                lo, hi; solve_kwargs...)
+        catch err
+            err isa InterruptException && rethrow()
+            nothing
+        end
+        restart === nothing && break
+        restart.objective < solution.objective || break
+        solution = restart
+    end
+    return solution
+end
+
 """
     _PrimalValueCache(f, n)
 
@@ -431,6 +511,8 @@ function cocoReg(type, order, data, covariates = nothing, starting_values = noth
             solve_kwargs...)
         solution = _restart_near_bounds(solution, optimization_function, optimizer,
             default_optimizer, lo, hi; solve_kwargs...)
+        solution = _restart_kkt_bounds(solution, objective, optimization_function,
+            optimizer, default_optimizer, lo, hi; solve_kwargs...)
         parameter = _to_bounded.(solution.u, lo, hi)
     end
 
