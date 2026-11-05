@@ -168,6 +168,69 @@ end
     @test isfinite(Coconots.bivariate_generalized_poisson(171, 2, 1.5, 0.0, 0.3, 0.0, 0.2))
 end
 
+@testset "order-1 likelihood at alpha = 0 and alpha = 1" begin
+    # g(r | y) contains alpha (alpha + psi r)^(r - 1), which is 0 * Inf = NaN at
+    # alpha = 0 and r = 0, and (1 - alpha) (1 - alpha + psi (y - r))^(y - r - 1),
+    # which is 0 * Inf = NaN at alpha = 1 (psi = 0) and r = y. The limit is the
+    # value just inside the boundary. At alpha = 1, P(x | y) = 0 for x < y, so
+    # the likelihood is compared on a nondecreasing series there.
+    Random.seed!(20261111)
+    data = cocoSim("GP", 1, [0.3, 0.2, 1.5], 150)
+    data_up = cumsum([rand() < 0.15 ? 1 : 0 for _ in 1:150])
+    lambdas = [1.5 * exp(0.3 * sin(2pi * t / 25)) for t in 1:150]
+    # second-order one-sided differences in direction dir[i] = +1 / -1,
+    # central for dir[i] = 0
+    function fd_grad(f, par, dir; h = 1e-6)
+        map(eachindex(par)) do i
+            e = zeros(length(par))
+            e[i] = h
+            dir[i] == 0 && return (f(par + e) - f(par - e)) / (2 * h)
+            e .*= dir[i]
+            dir[i] * (-3 * f(par) + 4 * f(par + e) - f(par + 2 * e)) / (2 * h)
+        end
+    end
+    for (a, a_in, d, x) in ((0.0, 1e-12, 1, data), (1.0, 1 - 1e-12, -1, data_up)),
+            eta in (0.0, 0.2), lam in (nothing, lambdas)
+        # t = (alpha, eta, lambda or a factor of the time-varying rates)
+        nll(t) = Coconots.compute_negative_log_likelihood_GP1(
+            lam === nothing ? t[3] : lam .* t[3], t[1], t[2], x)
+        scale = lam === nothing ? 1.5 : 1.0
+        p0 = [a, eta, scale]
+        l0 = nll(p0)
+        l1 = nll([a_in, eta, scale])
+        @test isfinite(l0)
+        @test isapprox(l0, l1; rtol = 1e-8)
+        grad = ForwardDiff.gradient(nll, p0)
+        @test all(isfinite, grad)
+        @test isapprox(grad, fd_grad(nll, p0, [d, eta == 0 ? 1 : 0, 0]); rtol = 1e-5)
+        @test all(isfinite, ForwardDiff.hessian(nll, p0))
+    end
+    for (a, a_in) in ((0.0, 1e-12), (1.0, 1 - 1e-12)), eta in (0.0, 0.2), y in 0:8
+        for r in 0:y
+            g0 = Coconots.compute_g_r_y(y, r, a, eta, 1.5)
+            g1 = Coconots.compute_g_r_y(y, r, a_in, eta, 1.5)
+            @test isfinite(g0)
+            @test isapprox(g0, g1; atol = 1e-10)
+        end
+        pmf = Coconots.convolution_pmf_vector(15, y, 1.5, a, eta)
+        @test all(isfinite, pmf)
+        @test isapprox(pmf, Coconots.convolution_pmf_vector(15, y, 1.5, a_in, eta);
+            rtol = 1e-8)
+    end
+    # limits: alpha = 0 thins every count to 0, alpha = 1 keeps it
+    @test Coconots.compute_g_r_y(5, 0, 0.0, 0.2, 1.5) == 1
+    @test Coconots.compute_g_r_y(5, 5, 1.0, 0.2, 1.5) == 1
+    # log-space branch (count above 170)
+    for (a, r) in ((0.0, 0), (0.0, 1), (1.0, 171), (1.0, 170)), eta in (0.0, 0.2)
+        g = Coconots.compute_g_r_y(171, r, a, eta, 1.5)
+        @test isfinite(g)
+        @test isapprox(g, (r == 0 && a == 0) || (r == 171 && a == 1) ? 1.0 : 0.0;
+            atol = 1e-12)
+        dg = ForwardDiff.derivative(t -> Coconots.compute_g_r_y(171, r, t, eta, 1.5), a)
+        @test isfinite(dg)
+    end
+end
+
 @testset "cocoReg" begin
     Random.seed!(7)
     data = cocoSim("GP", 1, [0.4, 0.2, 2.0], 300)

@@ -1,13 +1,70 @@
 """
+    _g_power_factor(prefactor, logpart, base, n)
+
+Multiplies `base^n` into `prefactor * exp(logpart)`: as `n log(base)` into
+`logpart` for a nonzero base, directly into `prefactor` for a base whose primal
+value is zero (where `n log(base)` is `0 * (-Inf)` for `n = 0` and the
+ForwardDiff partials of `exp(log(0))` are `NaN`). `n = 0` contributes nothing.
+"""
+@inline function _g_power_factor(prefactor, logpart, base, n::Int)
+    n == 0 && return prefactor, logpart
+    _is_zero_value(base) && return prefactor * base^n, logpart
+    return prefactor, logpart + n * log(base)
+end
+
+"""
+    _g_r_y_on_bound(yi, ri, alpha, psi)
+
+`g(r | y)` of [`compute_g_r_y`](@ref) for `alpha` exactly 0 or exactly 1 (primal
+value; boundary estimates are returned exactly on the bounds). There the
+factor `alpha (alpha + psi r)^(r - 1)` at `r = 0` (`alpha = 0`) or
+`(1 - alpha) (1 - alpha + psi (y - r))^(y - r - 1)` at `r = y` (`alpha = 1`,
+`psi = 0`) is `0 * Inf = NaN`. Both factors equal 1 identically in the
+parameters for `alpha` in `(0, 1)` (`psi * 0` is exactly 0), so they are
+replaced by their limit 1 (zero partials, which is their exact derivative); all
+other factors are those of `compute_g_r_y`. In the log-space branch the
+prefactors `alpha`, `1 - alpha` and zero bases are multiplied directly instead
+of via `log`, so the value and the ForwardDiff partials stay finite.
+"""
+function _g_r_y_on_bound(yi::Int, ri::Int, alpha::Real, psi::Real)
+    S = promote_type(typeof(alpha), typeof(psi))
+    ki = yi - ri
+    a_limit = ri == 0 && _is_zero_value(alpha)
+    b_limit = ki == 0 && _is_zero_value(1 - alpha)
+    if yi <= MAX_FACTORIAL_ARGUMENT
+        a = a_limit ? one(S) : alpha * (alpha + psi * ri)^(ri - 1)
+        b = b_limit ? one(S) : (1 - alpha) * (1 - alpha + psi * ki)^(ki - 1)
+        return float_factorial(yi) / float_factorial(ri) / float_factorial(ki) * a * b /
+               (1 + psi * yi)^(yi - 1)
+    end
+    prefactor = one(S)
+    logpart = logfactorial(yi) - logfactorial(ri) - logfactorial(ki) -
+              (yi - 1) * log(1 + psi * yi)
+    if !a_limit
+        prefactor *= alpha
+        prefactor, logpart = _g_power_factor(prefactor, logpart, alpha + psi * ri, ri - 1)
+    end
+    if !b_limit
+        prefactor *= 1 - alpha
+        prefactor, logpart = _g_power_factor(prefactor, logpart, 1 - alpha + psi * ki,
+            ki - 1)
+    end
+    return prefactor * exp(logpart)
+end
+
+"""
     compute_g_r_y(y, r, alpha, eta, lambda)
 
 Convolution probability mass `g(r | y)` of the first-order model (closed
 form). Uses the factorial lookup table for `y <= 170` and log-space
-evaluation beyond, so no `BigInt`s are ever allocated.
+evaluation beyond, so no `BigInt`s are ever allocated. With `alpha` exactly 0
+or 1, [`_g_r_y_on_bound`](@ref) (the arithmetic inside `(0, 1)` is unchanged).
 """
 function compute_g_r_y(y::Real, r::Real, alpha::Real, eta::Real, lambda::Real)
     yi, ri = Int(y), Int(r)
     psi = eta * (1 - alpha) / lambda
+    (_is_zero_value(alpha) || _is_zero_value(1 - alpha)) &&
+        return _g_r_y_on_bound(yi, ri, alpha, psi)
     if yi <= MAX_FACTORIAL_ARGUMENT
         return float_factorial(yi) / float_factorial(ri) / float_factorial(yi - ri) *
                alpha * (1 - alpha) * (alpha + psi * ri)^(ri - 1) *
