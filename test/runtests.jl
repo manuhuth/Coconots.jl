@@ -217,3 +217,73 @@ end
     @test Coconots.get_link_function("identity")(2.5) == 2.5
     @test_throws ErrorException Coconots.get_link_function("unknown")
 end
+
+@testset "default starting values equal the coconots (R) default start" begin
+    # Expected values are the formulas of coconots' cocoReg_base.R (cocoReg
+    # defaults: seasonality c(1, 2), replace.start.val 1e-5,
+    # iteration.start.val 0.6; GP2 shrinks by 0.99), evaluated by hand.
+    start(type, order, x) = Coconots.get_starting_values!(type, order, x, nothing,
+        nothing, Coconots._n_parameters_without_covariates(type, order), -Inf)
+
+    # x = (0,0,0,0,0,0,3,3,3): mean 1, z = x - 1 = (-1 x 6, 2 x 3),
+    # sum z^2 = 18, var = 18 / 8 = 9/4, so eta = 1 - (4/9)^0.5 = 1/3;
+    # acf(1) = 11/18, acf(2) = 4/18 = 2/9 (lag sums 11 and 4 over 18);
+    # mu111 = (-1 -1 -1 -1 +2 -4 +8) / 9 = 2/9.
+    x = [0, 0, 0, 0, 0, 0, 3, 3, 3]
+    # Poisson 1: alpha = 11/18, lambda = 1 * (1 - 11/18) = 7/18
+    @test isapprox(start("Poisson", 1, x), [11 / 18, 7 / 18]; rtol = 1e-12)
+    # GP 1: lambda = 1 * (2/3) * (7/18) = 7/27
+    @test isapprox(start("GP", 1, x), [11 / 18, 1 / 3, 7 / 27]; rtol = 1e-12)
+    # GP 2: alpha3 = (2/9) (2/3)^4 / (5/3) = 32/1215 ~ 0.026337,
+    # alpha2 = 2/9 - 32/1215 = 238/1215 ~ 0.195885,
+    # alpha1 = 11/18 - 32/1215 = 1421/2430 ~ 0.584774;
+    # sum ~ 0.807 <= 1, but 2 alpha1 + alpha3 = 2906/2430 ~ 1.1959 > 1, so
+    # alpha1 and alpha3 are multiplied by 0.99 eighteen times
+    # (0.99^17 * 1.1959 ~ 1.008 > 1, 0.99^18 * 1.1959 ~ 0.998 <= 1).
+    # Expected ~ (0.997985, 0.022023, 0.399751, 0.333333, 0.196089).
+    s = 0.99^18
+    a1 = 1421 / 2430 * s
+    a3 = 32 / 1215 * s
+    a2 = 238 / 1215
+    @test isapprox(start("GP", 2, x),
+        [2 * a1 + a3, a3 / (2 * a1 + a3), a2 / (1 - a1 - a3), 1 / 3,
+            (2 / 3) * (1 - a1 - a2 - a3)]; rtol = 1e-12)
+
+    # x = (0,0,0,0,0,2,2,2,2,2): mean 1, z = (-1 x 5, 1 x 5), acf(1) = 7/10,
+    # acf(2) = 4/10, mu111 = (-3 + 1 - 1 + 3) / 10 = 0.
+    # Poisson 2: alpha3 = 0, alpha2 = 0.4, alpha1 = 0.7; the sum 1.1 > 1, so all
+    # three are multiplied by 0.6 once: (0.42, 0.24, 0); lambda = 1 - 0.66.
+    x = [0, 0, 0, 0, 0, 2, 2, 2, 2, 2]
+    @test isapprox(start("Poisson", 2, x), [0.84, 0.0, 0.24 / 0.58, 0.34];
+        rtol = 1e-12, atol = 1e-14)
+
+    # negative acf(1) is replaced by 1e-5 (not its absolute value):
+    # x = (0,2,0,2,0,2), acf(1) = -5/6
+    x = [0, 2, 0, 2, 0, 2]
+    @test isapprox(start("Poisson", 1, x), [1e-5, 1 - 1e-5]; rtol = 1e-12)
+    # underdispersion: x = (0,1,2,1,0,1,2,1,0,1,2,1) has mean 1, var = 6/11,
+    # mean / var = 11/6 > 1, so 1 - (11/6)^0.5 < 0 is replaced by eta = 1e-5
+    @test start("GP", 1, [0, 1, 2, 1, 0, 1, 2, 1, 0, 1, 2, 1])[2] == 1e-5
+
+    # user-supplied starts are returned unchanged
+    @test Coconots.get_starting_values!("GP", 1, x, nothing, [0.1, 0.2, 0.3], 2,
+        -Inf) == [0.1, 0.2, 0.3]
+end
+
+@testset "cocoPit uses t = order + 1, ..., n" begin
+    Random.seed!(3)
+    data = cocoSim("GP", 1, [0.4, 0.2, 2.0], 60)
+    fit = cocoReg("GP", 1, data)
+    alpha, eta, lambda = fit["parameter"]
+    x = Int.(data)
+    n = length(x)
+    Px = [Coconots.compute_distribution_convolution_x_r_y(x[t], x[t - 1], lambda,
+              alpha, eta) for t in 2:n]
+    Pxm1 = [Coconots.compute_distribution_convolution_x_r_y(x[t] - 1, x[t - 1],
+                lambda, alpha, eta) for t in 2:n]
+    F = [mean(clamp.((ui .- Pxm1) ./ (Px .- Pxm1), 0, 1))
+         for ui in range(0, 1, length = 11)]
+    pit = cocoPit(fit, 10)
+    @test isapprox(pit["Pit_values"], diff(F); atol = 1e-8)
+    @test isapprox(sum(pit["Pit_values"]), 1.0; atol = 1e-10)
+end
