@@ -860,10 +860,12 @@ with the rate-derived quantities `c = lambda U (1 - alpha1 - alpha3)`,
 `exp(j eta)` is a running product with the hoisted `exp_eta = exp(eta)`; with
 `eta_is_zero` the summands are built by their ratio
 `term(j + 1) / term(j) = d (y - j) (z - j) / (c^2 (j + 1))` instead of three
-powers each. Equal to `bivariate_generalized_poisson` up to rounding.
+powers each. Equal to `bivariate_generalized_poisson` up to rounding; with `d`
+exactly zero, [`_bivariate_gp_zero_rate`](@ref) (as there).
 """
 function _gp2_normalizer(y::Int, z::Int, c::Real, d::Real, beta13::Real, eta::Real,
         exp_eta::Real, eta_is_zero::Bool)
+    _is_zero_value(d) && return _bivariate_gp_zero_rate(y, z, c, d, beta13, eta)
     m = min(y, z)
     if eta_is_zero
         j0 = 0  # the j = 0 summand, written exactly as in bivariate_generalized_poisson

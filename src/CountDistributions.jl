@@ -110,11 +110,73 @@ is differentiable in `lambda` and `eta`.
 end
 
 """
+    _primal_value(x)
+
+Innermost primal value of `x` (for nested `ForwardDiff.Dual`s the value of the
+innermost number), `x` itself for other numbers.
+"""
+@inline _primal_value(x::Real) = x
+@inline _primal_value(x::ForwardDiff.Dual) = _primal_value(ForwardDiff.value(x))
+
+"""
+    _is_zero_value(x)
+
+True iff the primal value of `x` is exactly zero, whatever its partials.
+"""
+@inline _is_zero_value(x::Real) = _primal_value(x) == 0
+
+"""
+    _bivariate_gp_zero_rate(y, z, c, d, beta13, eta)
+
+Bivariate Generalized Poisson mass of `(y, z)` when
+`d = lambda U (alpha1 + alpha3)` is exactly zero, i.e. `alpha1 = alpha3 = 0`
+(boundary estimates are returned exactly at 0). With `c` and
+`beta13 = beta1 + beta3` as in [`bivariate_generalized_poisson`](@ref). The
+`j = 0` summand there carries the factor `beta13 * d^(-1)` of the GP pmf of rate
+`d` at 0, which is `0 * Inf = NaN` at `d = 0`; since `beta13` equals `d`
+identically in the parameters, that factor is its limit 1 and the `j = 0`
+summand is evaluated without it. The summands `j >= 1` are those of
+`bivariate_generalized_poisson` (finite at `d = 0`: the exponent of
+`(d + eta j)^(j - 1)` is non-negative; in the log-space branch a zero base is
+raised directly instead of via `log`). Both parts are the analytic expression at
+every parameter value, so `ForwardDiff.Dual`s carry the exact partials.
+"""
+function _bivariate_gp_zero_rate(y::Int, z::Int, c::Real, d::Real, beta13::Real,
+        eta::Real)
+    S = promote_type(typeof(c), typeof(d), typeof(beta13), typeof(eta))
+    direct = max(y, z) <= MAX_FACTORIAL_ARGUMENT
+    if direct
+        head = (c + eta * y)^(y - 1) * (c + eta * z)^(z - 1) / float_factorial(y) /
+               float_factorial(z)
+    else
+        head = exp((y - 1) * log(c + eta * y) + (z - 1) * log(c + eta * z) -
+                   logfactorial(y) - logfactorial(z))
+    end
+    tail = zero(S)
+    for j in 1:min(y, z)
+        base = d + eta * j
+        if direct
+            tail += (c + eta * (y - j))^(y - j - 1) * (c + eta * (z - j))^(z - j - 1) *
+                    base^(j - 1) / float_factorial(j) / float_factorial(y - j) /
+                    float_factorial(z - j) * exp(j * eta)
+        else
+            rest = (y - j - 1) * log(c + eta * (y - j)) +
+                   (z - j - 1) * log(c + eta * (z - j)) - logfactorial(j) -
+                   logfactorial(y - j) - logfactorial(z - j) + j * eta
+            tail += _is_zero_value(base) ? base^(j - 1) * exp(rest) :
+                    exp((j - 1) * log(base) + rest)
+        end
+    end
+    return (head + beta13 * tail) * c^2 * exp(-beta13 - 2 * c - y * eta - z * eta)
+end
+
+"""
     bivariate_generalized_poisson(y, z, lambda, alpha1, alpha2, alpha3, eta)
 
 Joint probability mass function of the bivariate Generalized Poisson
 distribution of two consecutive counts `(y, z)`. All loop-invariant quantities
 are hoisted; factorials come from the lookup table (log-space beyond 170).
+With `alpha1 + alpha3` exactly zero, [`_bivariate_gp_zero_rate`](@ref).
 """
 function bivariate_generalized_poisson(y::Real, z::Real, lambda::Real, alpha1::Real,
         alpha2::Real, alpha3::Real, eta::Real)
@@ -124,6 +186,7 @@ function bivariate_generalized_poisson(y::Real, z::Real, lambda::Real, alpha1::R
     beta3 = compute_beta_i(lambda, U, alpha3)
     c = lambda * U * (1 - alpha1 - alpha3)
     d = lambda * U * (alpha1 + alpha3)
+    _is_zero_value(d) && return _bivariate_gp_zero_rate(yi, zi, c, d, beta1 + beta3, eta)
 
     total = zero(promote_type(typeof(c), typeof(eta)))
     if max(yi, zi) <= MAX_FACTORIAL_ARGUMENT

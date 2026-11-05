@@ -121,6 +121,53 @@ end
     @test all(isfinite, grad)
 end
 
+@testset "order-2 likelihood at alpha1 = alpha3 = 0" begin
+    # With alpha1 = alpha3 = 0 the rate d = lambda U (alpha1 + alpha3) of the
+    # bivariate normalizer is zero and the j = 0 summand evaluated
+    # (beta1 + beta3) * d^(-1) = 0 * Inf = NaN. The limit is the value just
+    # inside the boundary. Gradients are compared with one-sided finite
+    # differences at the boundary (the ForwardDiff gradient at alpha = 1e-12
+    # loses digits to the cancellation in (beta1 + beta3) / d).
+    Random.seed!(20261108)
+    data = cocoSim("GP", 2, [0.05, 0.3, 0.05, 0.2, 1.5], 150)
+    lambdas = [1.5 * exp(0.3 * sin(2pi * t / 25)) for t in 1:length(data)]
+    function fd_grad(f, par, idx; h = 1e-6)
+        map(eachindex(par)) do i
+            e = zeros(length(par))
+            e[i] = h
+            i in idx ? (-3 * f(par) + 4 * f(par + e) - f(par + 2 * e)) / (2 * h) :
+            (f(par + e) - f(par - e)) / (2 * h)
+        end
+    end
+    # t[5] is lambda (constant rate) or a factor of the time-varying rates
+    for eta in (0.0, 0.2), lam in (nothing, lambdas)
+        nll(t) = Coconots.compute_negative_log_likelihood_GP2(
+            lam === nothing ? t[5] : lam .* t[5], t[1], t[2], t[3], t[4], data)
+        scale = lam === nothing ? 1.5 : 1.0
+        p0 = [0.0, 0.3, 0.0, eta, scale]
+        l0 = nll(p0)
+        l1 = nll([1e-12, 0.3, 1e-12, eta, scale])
+        @test isfinite(l0)
+        @test isapprox(l0, l1; rtol = 1e-8)
+        grad = ForwardDiff.gradient(nll, p0)
+        @test all(isfinite, grad)
+        idx = eta == 0 ? (1, 3, 4) : (1, 3)
+        @test isapprox(grad, fd_grad(nll, p0, idx); rtol = 1e-5)
+        @test all(isfinite, ForwardDiff.hessian(nll, p0))
+    end
+    for y in 0:6, z in 0:6, eta in (0.0, 0.2)
+        p0 = Coconots.bivariate_generalized_poisson(y, z, 1.5, 0.0, 0.3, 0.0, eta)
+        p1 = Coconots.bivariate_generalized_poisson(y, z, 1.5, 1e-12, 0.3, 1e-12, eta)
+        @test isfinite(p0) && p0 > 0
+        @test isapprox(p0, p1; rtol = 1e-8)
+        U = 1 / 0.7
+        q0 = Coconots._gp2_normalizer(y, z, 1.5 * U, 0.0, 0.0, eta, exp(eta), eta == 0)
+        @test isapprox(q0, p0; rtol = 1e-12)
+    end
+    # log-space branch (count above 170)
+    @test isfinite(Coconots.bivariate_generalized_poisson(171, 2, 1.5, 0.0, 0.3, 0.0, 0.2))
+end
+
 @testset "cocoReg" begin
     Random.seed!(7)
     data = cocoSim("GP", 1, [0.4, 0.2, 2.0], 300)
