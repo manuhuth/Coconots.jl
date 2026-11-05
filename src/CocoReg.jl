@@ -280,6 +280,53 @@ function _restart_near_bounds(solution, optimization_function, optimizer,
 end
 
 """
+    _PrimalValueCache(f, n)
+
+Callable wrapper of the objective `f` for the optimizer. OptimizationOptimJL
+evaluates `fg!` (no fused `fg` is generated for Optim.jl solvers) as a
+ForwardDiff gradient followed by a separate plain evaluation of `f` at the
+same point, although the gradient pass already carries that value as the
+primal part of its result. A first-order dual evaluation therefore records
+its point and primal value, and a plain `Float64` evaluation at exactly that
+point returns the recorded value instead of evaluating `f` again (one
+objective pass fewer per gradient call). Any other input, and any plain
+evaluation at a different point, is passed through to `f`.
+"""
+mutable struct _PrimalValueCache{F}
+    f::F
+    u::Vector{Float64}
+    value::Float64
+    valid::Bool
+end
+
+_PrimalValueCache(f::F, n::Integer) where {F} = _PrimalValueCache{F}(f,
+    Vector{Float64}(undef, n), NaN, false)
+
+function (cache::_PrimalValueCache)(u::AbstractVector{<:ForwardDiff.Dual{<:Any, Float64}})
+    y = cache.f(u)
+    if y isa ForwardDiff.Dual && ForwardDiff.value(y) isa Float64 &&
+       length(u) == length(cache.u)
+        @inbounds for i in eachindex(cache.u, u)
+            cache.u[i] = ForwardDiff.value(u[i])
+        end
+        cache.value = ForwardDiff.value(y)
+        cache.valid = true
+    else
+        cache.valid = false
+    end
+    return y
+end
+
+function (cache::_PrimalValueCache)(u::AbstractVector{Float64})
+    if cache.valid && length(u) == length(cache.u) && u == cache.u
+        return cache.value
+    end
+    return cache.f(u)
+end
+
+(cache::_PrimalValueCache)(u::AbstractVector) = cache.f(u)
+
+"""
     cocoReg(type, order, data, covariates=nothing, starting_values=nothing,
             link_function="log", lower_bound_covariates=-Inf, max_loop=nothing,
             optimizer=nothing; adtype=Optimization.AutoForwardDiff(),
@@ -342,8 +389,8 @@ function cocoReg(type, order, data, covariates = nothing, starting_values = noth
         optimizer = default_optimizer ? LBFGS() : optimizer
         lo, hi = Float64.(lower), Float64.(upper)
         u0 = _to_unconstrained.(Float64.(starting_values), lo, hi)
-        optimization_function = OptimizationFunction(
-            (u, _) -> objective(_to_bounded.(u, lo, hi)), adtype)
+        cached = _PrimalValueCache(u -> objective(_to_bounded.(u, lo, hi)), length(u0))
+        optimization_function = OptimizationFunction((u, _) -> cached(u), adtype)
         problem = OptimizationProblem(optimization_function, u0)
         solution = _solve_default_with_fallback(problem, optimizer, default_optimizer;
             solve_kwargs...)

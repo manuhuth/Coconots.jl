@@ -49,6 +49,66 @@ function _transition_pmf(cocoReg_fit, t::Integer, xmax::Integer,
     return convolution_pmf_vector(kernel, xmax, y, z, cocoReg_fit["max_loop"])
 end
 
+_history_key(data::Vector{Int}, t::Integer, order::Integer) =
+    order == 1 ? (data[t - 1], 0) : (data[t - 1], data[t - 2])
+
+"""
+    _history_pmfs(cocoReg_fit, data, lambdas, eta, kernel, xmax_of)
+
+For a constant-rate fit the transition pmf of observation `t` depends only on
+its history (`x_{t-1}`, and `x_{t-2}` for order 2). Returns a `Dict` from the
+history (see `_history_key`) to its pmf on `0:xmax`, with `xmax` the largest
+`xmax_of(t)` over the observations sharing that history, so each pmf is
+computed once per history instead of once per observation. The entries of
+[`convolution_pmf_vector`](@ref) on `0:m` do not depend on the length of the
+requested support beyond `m` (same terms, same summation order), so every
+value equals the per-observation computation. Returns `nothing` for covariate
+fits (observation-specific rates).
+"""
+function _history_pmfs(cocoReg_fit, data::Vector{Int}, lambdas, eta::Real, kernel,
+        xmax_of::F) where {F}
+    isnothing(cocoReg_fit["covariates"]) || return nothing
+    order = Int(cocoReg_fit["order"])
+    first_t = order + 1
+    xmax_needed = Dict{NTuple{2, Int}, Int}()
+    for t in first_t:length(data)
+        key = _history_key(data, t, order)
+        xmax_needed[key] = max(get(xmax_needed, key, 0), Int(xmax_of(t)))
+    end
+    pmfs = Dict{NTuple{2, Int}, Any}()
+    for t in first_t:length(data)
+        key = _history_key(data, t, order)
+        haskey(pmfs, key) && continue
+        pmfs[key] = _transition_pmf(cocoReg_fit, t, xmax_needed[key], data, lambdas, eta,
+            kernel)
+    end
+    return pmfs
+end
+
+"""
+    _score_terms(pmf, x, max_x)
+
+Per-observation terms of [`compute_scores`](@ref) from the transition pmf
+(support at least `0:max(max_x, x)`): `log(pmf[x])`, `sum(pmf^2) - 2 pmf[x]`
+and the ranked probability score, both on `0:max_x`. A function barrier: the
+pmf comes out of the untyped fit `Dict`, so the summation loop is compiled
+for its concrete type here. Same operations in the same order as the former
+inline loop.
+"""
+function _score_terms(pmf::AbstractVector, x::Int, max_x::Int)
+    log_term = log(pmf[x + 1])
+    h_index = 0.0
+    cdf = 0.0
+    rps = 0.0
+    @inbounds for s in 0:max_x
+        p = pmf[s + 1]
+        h_index += p^2
+        cdf += p
+        rps += (x <= s ? 1 - cdf : cdf)^2
+    end
+    return log_term, h_index - 2 * pmf[x + 1], rps
+end
+
 """
     cocoPit(cocoReg_fit, n_bins=21)
 
@@ -69,8 +129,12 @@ function cocoPit(cocoReg_fit, n_bins = 21)
     kernel = _constant_kernel(cocoReg_fit, data, lambdas, eta, maximum(data))
     Px = Vector{Float64}(undef, n - order)
     Pxm1 = Vector{Float64}(undef, n - order)
+    pmfs = _history_pmfs(cocoReg_fit, data, lambdas, eta, kernel, t -> data[t])
     for t in first_t:n
-        pmf = _transition_pmf(cocoReg_fit, t, data[t], data, lambdas, eta, kernel)
+        # same values as the per-observation pmf on 0:data[t] (prefix copy)
+        pmf = pmfs === nothing ?
+              _transition_pmf(cocoReg_fit, t, data[t], data, lambdas, eta, kernel) :
+              pmfs[_history_key(data, t, order)][1:(data[t] + 1)]
         cdf_x = sum(pmf)
         Px[t - order] = cdf_x
         Pxm1[t - order] = cdf_x - pmf[data[t] + 1]
@@ -124,22 +188,17 @@ function compute_scores(cocoReg_fit, max_x = 50)
     quad_score_sum = 0.0
     rps_sum = 0.0
 
+    pmfs = _history_pmfs(cocoReg_fit, data, lambdas, eta, kernel,
+        t -> max(max_x, data[t]))
     for t in first_t:n
         x = data[t]
-        pmf = _transition_pmf(cocoReg_fit, t, max(max_x, x), data, lambdas, eta, kernel)
+        pmf = pmfs === nothing ?
+              _transition_pmf(cocoReg_fit, t, max(max_x, x), data, lambdas, eta, kernel) :
+              pmfs[_history_key(data, t, order)]
 
-        log_score_sum -= log(pmf[x + 1])
-
-        h_index = 0.0
-        cdf = 0.0
-        rps = 0.0
-        @inbounds for s in 0:max_x
-            p = pmf[s + 1]
-            h_index += p^2
-            cdf += p
-            rps += (x <= s ? 1 - cdf : cdf)^2
-        end
-        quad_score_sum += h_index - 2 * pmf[x + 1]
+        log_term, quad_term, rps = _score_terms(pmf, x, max_x)
+        log_score_sum -= log_term
+        quad_score_sum += quad_term
         rps_sum += rps
     end
 
