@@ -31,20 +31,45 @@ function cocoBoot(cocoReg_fit, lags = [1:1:21;], n_bootstrap = 400, alpha = 0.05
         "lags" => lags)
 end
 
+# Upper bound on the number of simulated counts held in memory at once; the
+# replicates are simulated in blocks of at most this many entries.
+const _BOOT_BLOCK_ENTRIES = 4_194_304
+
 """
     compute_random_pacfs(cocoReg_fit, lags, n_bootstrap=400, n_burn_in=200)
 
 Autocorrelations of `n_bootstrap` datasets simulated from the fitted model.
-Returns an `(n_bootstrap, length(lags))` matrix.
+Returns an `(n_bootstrap, length(lags))` matrix. The replicates are simulated
+jointly, time step by time step (in memory-bounded blocks), so that the
+conditional distributions of each step are tabulated once and shared by all
+replicates with the same history.
 """
 function compute_random_pacfs(cocoReg_fit, lags, n_bootstrap = 400, n_burn_in = 200,
         pacfs = Array{Float64}(undef, Int(n_bootstrap), length(lags)))
     n = length(cocoReg_fit["data"])
-    for b in 1:Int(n_bootstrap)
-        simulated = cocoSim(cocoReg_fit["type"], Int(cocoReg_fit["order"]),
-            cocoReg_fit["parameter"], n, cocoReg_fit["covariates"],
-            cocoReg_fit["link"], n_burn_in, zeros(n + Int(n_burn_in)))
-        pacfs[b, :] = compute_partial_autocorrelation(simulated, lags)
+    n_bootstrap = Int(n_bootstrap)
+    n_burn_in = Int(n_burn_in)
+    n_total = n + n_burn_in
+    lambda, sampler = _simulation_setup(cocoReg_fit["type"], Int(cocoReg_fit["order"]),
+        cocoReg_fit["parameter"], n, cocoReg_fit["covariates"], cocoReg_fit["link"],
+        n_burn_in)
+
+    block = clamp(div(_BOOT_BLOCK_ENTRIES, max(n_total, 1)), 1, max(n_bootstrap, 1))
+    X = Matrix{Int}(undef, block, n_total)
+    simulated = Vector{Float64}(undef, n)
+    first_rep = 1
+    while first_rep <= n_bootstrap
+        n_rep = min(block, n_bootstrap - first_rep + 1)
+        Xb = view(X, 1:n_rep, :)
+        fill!(Xb, 0)
+        _simulate_paths!(Xb, sampler, lambda, n_burn_in)
+        for b in 1:n_rep
+            for i in 1:n
+                simulated[i] = Xb[b, n_burn_in + i]
+            end
+            pacfs[first_rep + b - 1, :] = compute_partial_autocorrelation(simulated, lags)
+        end
+        first_rep += n_rep
     end
     return pacfs
 end
