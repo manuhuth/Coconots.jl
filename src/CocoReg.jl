@@ -240,7 +240,9 @@ solution with every coordinate within `_RESTART_MARGIN` of a bound moved that
 far inside; later restarts start from the current solution as it is, with
 fresh curvature memory, and stop once the objective no longer decreases by
 more than `1e-10`. A restart is kept only if it lowers the objective. At an
-interior stationary point a restart stops at its first gradient check.
+interior stationary point a restart stops at its first gradient check. A
+restart that started from the current solution and did not improve ends the
+restarts (the next one would repeat the same deterministic solve).
 Restarts use [`_solve_default_with_fallback`](@ref) with `allow_fallback`; a
 restart that still throws ends the restarts and keeps the current solution.
 """
@@ -250,8 +252,10 @@ function _restart_near_bounds(solution, optimization_function, optimizer,
         u_restart = copy(solution.u)
         if k == 1
             x = _to_bounded.(solution.u, lo, hi)
-            u_restart = _to_unconstrained.(_pull_inside.(x, lo, hi, _RESTART_MARGIN),
-                lo, hi)
+            x_inside = _pull_inside.(x, lo, hi, _RESTART_MARGIN)
+            # no coordinate near a bound: start from solution.u itself instead of
+            # its (rounding-level different) transform round trip
+            x_inside == x || (u_restart = _to_unconstrained.(x_inside, lo, hi))
         end
         restart = try
             _solve_default_with_fallback(
@@ -265,6 +269,10 @@ function _restart_near_bounds(solution, optimization_function, optimizer,
         improvement = isfinite(solution.objective) ?
                       solution.objective - restart.objective :
                       (isfinite(restart.objective) ? Inf : 0.0)
+        # The next restart starts from solution.u; if this one started there too
+        # (k = 1 with no coordinate near a bound) and did not improve, the
+        # deterministic solve would only repeat itself.
+        !(improvement > 0) && u_restart == solution.u && break
         improvement > 0 && (solution = restart)
         k > 1 && !(improvement > 1e-10) && break
     end

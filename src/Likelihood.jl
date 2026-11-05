@@ -234,6 +234,20 @@ function _gp2_g_vector!(g::Vector{T}, h::Vector{T}, kernel::GP2Kernel{T}, y::Int
     normalizer = bivariate_generalized_poisson(y, z, kernel.lambda, kernel.alpha1,
         kernel.alpha2, kernel.alpha3, kernel.eta)
     length(g) < rmax + 1 && resize!(g, rmax + 1)
+    base = _gp2_h_block!(h, kernel, y, z, rmax, smax)
+    return _gp2_g_vector!(g, kernel, h, base, y, z, rmax, normalizer, smax)
+end
+
+"""
+    _gp2_h_block!(h, kernel, y, z, rmax, smax)
+
+Fills the block `a in max(0, z - rmax):z`, `b in 0:y` of the inner-sum table
+`H(a, b)` (see [`_gp2_h_cell`](@ref)) into the caller-owned buffer `h`
+(grown if needed) and returns `base` with `H(a, b) = h[base[b + 1] + a + 1]`.
+Reads `gp_beta1[0:y]`, `gp_lambda[0:z]` and `gp_zeta[0:y]` only.
+"""
+function _gp2_h_block!(h::Vector{T}, kernel::GP2Kernel{T}, y::Int, z::Int, rmax::Int,
+        smax::Int) where {T}
     a_lo = max(0, z - rmax)
     na = z - a_lo + 1
     length(h) < na * (y + 1) && resize!(h, na * (y + 1))
@@ -241,8 +255,7 @@ function _gp2_g_vector!(g::Vector{T}, h::Vector{T}, kernel::GP2Kernel{T}, y::Int
         h[b * na + (a - a_lo) + 1] = _gp2_h_cell(kernel, a, b, smax)
     end
     # h[b * na + (a - a_lo) + 1] == h[base[b + 1] + a + 1] with this base
-    base = range(-a_lo; step = na, length = y + 1)
-    return _gp2_g_vector!(g, kernel, h, base, y, z, rmax, normalizer, smax)
+    return range(-a_lo; step = na, length = y + 1)
 end
 
 function _convolution_x_r_y_z!(g::Vector{T}, h::Vector{T}, kernel::GP2Kernel{T},
@@ -611,17 +624,147 @@ function compute_negative_log_likelihood_GP2(lambdas::AbstractVector, alpha1::Re
         end
         return sum(parts)
     end
-    # Serial path: reuse the kernel tables and the g / H buffers across t.
+    return _nll_gp2_covariates_serial(lambdas, alpha1, alpha2, alpha3, eta, data,
+        max_loop)
+end
+
+"""
+    _fill_gp_table_rec!(table, n, rate, eta, q, eta_is_zero)
+
+Writes the Generalized Poisson pmf at `0:n` into `table[1:n+1]` (grown if
+needed; entries beyond `n + 1` are left untouched). Same formula as
+[`generalized_poisson_distribution`](@ref), but with the exponential factor
+`exp(-rate - k eta)` carried as a running product with the hoisted
+`q = exp(-eta)` (one `exp` per table instead of one per entry). With
+`eta_is_zero` (eta and all its derivative parts exactly zero, i.e. the
+Poisson model) the pmf is the Poisson pmf and is built by the ratio
+`p(k) = p(k - 1) rate / k` without any power. Entries above
+`MAX_FACTORIAL_ARGUMENT` use the log-space path of
+`generalized_poisson_distribution`, as before. Equal to the per-entry
+evaluation up to rounding.
+"""
+function _fill_gp_table_rec!(table::Vector, n::Int, rate::Real, eta::Real, q::Real,
+        eta_is_zero::Bool)
+    length(table) < n + 1 && resize!(table, n + 1)
+    nrec = min(n, MAX_FACTORIAL_ARGUMENT)
+    p0 = exp(-rate - zero(eta))
+    @inbounds table[1] = p0
+    if eta_is_zero
+        p = p0
+        @inbounds for k in 1:nrec
+            p = p * rate / k
+            table[k + 1] = p
+        end
+    elseif nrec >= 1
+        e = p0 * q
+        @inbounds table[2] = e * rate
+        @inbounds for k in 2:nrec
+            e *= q
+            table[k + 1] = e * rate * (rate + k * eta)^(k - 1) / float_factorial(k)
+        end
+    end
+    @inbounds for k in (MAX_FACTORIAL_ARGUMENT + 1):n
+        table[k + 1] = generalized_poisson_distribution(k, rate, eta)
+    end
+    return table
+end
+
+"""
+    _gp2_normalizer(y, z, c, d, beta13, eta, exp_eta, eta_is_zero)
+
+[`bivariate_generalized_poisson`](@ref) of `(y, z)` for `max(y, z) <= 170`
+with the rate-derived quantities `c = lambda U (1 - alpha1 - alpha3)`,
+`d = lambda U (alpha1 + alpha3)` and `beta13 = beta1 + beta3` passed in.
+`exp(j eta)` is a running product with the hoisted `exp_eta = exp(eta)`; with
+`eta_is_zero` the summands are built by their ratio
+`term(j + 1) / term(j) = d (y - j) (z - j) / (c^2 (j + 1))` instead of three
+powers each. Equal to `bivariate_generalized_poisson` up to rounding.
+"""
+function _gp2_normalizer(y::Int, z::Int, c::Real, d::Real, beta13::Real, eta::Real,
+        exp_eta::Real, eta_is_zero::Bool)
+    m = min(y, z)
+    if eta_is_zero
+        j0 = 0  # the j = 0 summand, written exactly as in bivariate_generalized_poisson
+        term = c^(y - j0 - 1) * c^(z - j0 - 1) * d^(j0 - 1) / float_factorial(j0) /
+               float_factorial(y - j0) / float_factorial(z - j0)
+        total = term
+        ratio = d / (c * c)
+        for j in 0:(m - 1)
+            term = term * ratio * ((y - j) * (z - j) / (j + 1))
+            total += term
+        end
+    else
+        total = zero(promote_type(typeof(c), typeof(eta)))
+        ej = one(exp_eta)
+        for j in 0:m
+            j > 0 && (ej *= exp_eta)
+            total += (c + eta * (y - j))^(y - j - 1) * (c + eta * (z - j))^(z - j - 1) *
+                     (d + eta * j)^(j - 1) / float_factorial(j) / float_factorial(y - j) /
+                     float_factorial(z - j) * ej
+        end
+    end
+    return total * beta13 * c^2 * exp(-beta13 - 2 * c - y * eta - z * eta)
+end
+
+"""
+    _nll_gp2_covariates_serial(lambdas, alpha1, alpha2, alpha3, eta, data, max_loop)
+
+Serial second-order negative log-likelihood with observation-specific rates.
+Every pmf table depends on `lambda_t`, so the tables are rebuilt per `t`, but
+(i) only up to the index each one is read at for `(x, y, z)`: `beta1`, `zeta`
+on `0:y`, `beta3` on `0:min(y, rmax)`, `beta2` on `0:rmax`, `lambda` on
+`0:max(x, z)` with `rmax = min(x, y + z)` (previously all five on
+`0:max(x, y + z)`); (ii) the parameter-only factors (`U`, the alpha
+combinations, `exp(-eta)`, `exp(eta)`) are computed once per call; (iii) the
+tables and the normalizer avoid per-entry `exp` (and, for the Poisson model,
+all powers) via recurrences. Same factors and summation order as the generic
+kernel path otherwise.
+"""
+function _nll_gp2_covariates_serial(lambdas::AbstractVector, alpha1::Real, alpha2::Real,
+        alpha3::Real, eta::Real, data::AbstractVector, max_loop)
     S = promote_type(eltype(lambdas), typeof(alpha1), typeof(alpha2), typeof(alpha3),
         typeof(eta))
-    tables = (S[], S[], S[], S[], S[])
+    n = length(data)
+    U = compute_U(alpha1, alpha2, alpha3)
+    # parenthesized factors of compute_zeta and bivariate_generalized_poisson
+    zeta_factor = 1 - 2 * alpha1 - alpha3
+    c_factor = 1 - alpha1 - alpha3
+    d_factor = alpha1 + alpha3
+    eta_is_zero = iszero(eta)
+    q = exp(-eta)
+    exp_eta = exp(eta)
+    tb1, tb2, tb3, tl, tz = S[], S[], S[], S[], S[]
     g, h = S[], S[]
-    total = zero(T)
+    total = zero(S)
     for t in 3:n
         x, y, z = Int(data[t]), Int(data[t - 1]), Int(data[t - 2])
-        kernel = _gp2_kernel!(tables, lambdas[t], alpha1, alpha2, alpha3, eta,
-            max(x, y + z))
-        total -= log(_convolution_x_r_y_z!(g, h, kernel, x, y, z, max_loop))
+        lambda = lambdas[t]
+        rmax = min(x, y + z)
+        lambda_U = lambda * U
+        beta1 = lambda_U * alpha1
+        beta3 = lambda_U * alpha3
+        _fill_gp_table_rec!(tb1, y, beta1, eta, q, eta_is_zero)
+        _fill_gp_table_rec!(tb2, rmax, lambda_U * alpha2, eta, q, eta_is_zero)
+        _fill_gp_table_rec!(tb3, min(y, rmax), beta3, eta, q, eta_is_zero)
+        _fill_gp_table_rec!(tl, max(x, z), lambda, eta, q, eta_is_zero)
+        _fill_gp_table_rec!(tz, y, lambda_U * zeta_factor, eta, q, eta_is_zero)
+        kernel = GP2Kernel{S}(lambda, alpha1, alpha2, alpha3, eta, tb1, tb2, tb3, tl, tz)
+        if max(y, z) <= MAX_FACTORIAL_ARGUMENT
+            normalizer = _gp2_normalizer(y, z, lambda_U * c_factor, lambda_U * d_factor,
+                beta1 + beta3, eta, exp_eta, eta_is_zero)
+        else
+            normalizer = bivariate_generalized_poisson(y, z, lambda, alpha1, alpha2,
+                alpha3, eta)
+        end
+        smax = max_loop === nothing ? y : Int(max_loop)
+        length(g) < rmax + 1 && resize!(g, rmax + 1)
+        base = _gp2_h_block!(h, kernel, y, z, rmax, smax)
+        _gp2_g_vector!(g, kernel, h, base, y, z, rmax, normalizer, smax)
+        convolution = zero(S)
+        @inbounds for r in 0:rmax
+            convolution += g[r + 1] * tl[x - r + 1]
+        end
+        total -= log(convolution)
     end
     return total
 end
