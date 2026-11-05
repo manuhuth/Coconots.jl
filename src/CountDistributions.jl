@@ -47,6 +47,12 @@ is differentiable in `lambda` and `eta`.
 """
 @inline function generalized_poisson_distribution(x::Real, lambda::Real, eta::Real)
     xi = Int(x)
+    # x = 0 and x = 1 in closed form: the general expression evaluates
+    # lambda * lambda^(-1) at x = 0, which is NaN at lambda = 0 and whose
+    # ForwardDiff Hessian overflows (Inf - Inf) for tiny lambda, e.g. the rate
+    # beta2 = lambda * U * alpha2 when alpha2 is fitted to (nearly) zero.
+    xi == 0 && return exp(-lambda - zero(eta))
+    xi == 1 && return exp(-lambda - eta) * lambda
     if xi <= MAX_FACTORIAL_ARGUMENT
         return exp(-lambda - xi * eta) * lambda * (lambda + xi * eta)^(xi - 1) /
                float_factorial(xi)
