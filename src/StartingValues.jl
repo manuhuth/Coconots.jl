@@ -4,41 +4,82 @@
                          link_function = "log")
 
 Returns `starting_values` unchanged when provided; otherwise computes
-data-driven starting values for the requested model. For covariate models the
-innovation-rate start is replaced by the covariate coefficient starts of
-[`compute_covariate_starting_values`](@ref).
+data-driven starting values for the requested model. Covariate models use the
+alpha/eta starts of [`compute_starting_values_covariate_model`](@ref) and the
+covariate coefficient starts of [`compute_covariate_starting_values`](@ref).
 """
 function get_starting_values!(type, order, data, covariates, starting_values,
         n_parameter_without, lower_bound_covariates, link_function = "log")
     isnothing(starting_values) || return starting_values
-    if Int(order) == 2
-        starting_values = compute_starting_values_GP2_reparameterized(type, data)
-    else
-        starting_values = compute_starting_values_GP1(type, data)
-    end
     if !isnothing(covariates)
-        n = Int(n_parameter_without)
-        scale = _innovation_scale(type, order, starting_values, n)
+        base, scale = compute_starting_values_covariate_model(type, order, data)
         beta_start = compute_covariate_starting_values(data, covariates,
             link_function, scale, lower_bound_covariates)
-        starting_values = vcat(starting_values[1:n], beta_start)
+        return vcat(base, beta_start)
     end
-    return starting_values
+    if Int(order) == 2
+        return compute_starting_values_GP2_reparameterized(type, data)
+    end
+    return compute_starting_values_GP1(type, data)
 end
 
 """
-    _innovation_scale(type, order, starting_values, n_parameter_without)
+    compute_starting_values_covariate_model(type, order, data)
 
-`(1 - sum(alpha)) * (1 - eta)` at the starting values (`eta = 0` for Poisson);
-for order 2 the alphas are recovered from the reparameterized starts.
+Alpha/eta starting values of covariate models, mirroring coconots'
+`cocoReg_cov.R` at the `cocoReg` defaults (`seasonality = c(1, 2)`,
+`start.val.adjust = TRUE`, `replace.start.val = 1e-5`,
+`iteration.start.val = 0.6`):
+
+- `alpha = acf(1)` (order 1), set to `1e-5` if negative;
+- `eta = 1 - (mean / var)^0.5` (GP), set to `1e-5` if negative and to
+  `1 - 1e-5` if above one;
+- order 2: `alpha3 = mu111 (1 - eta)^4 / (mean (1 + 2 eta))`,
+  `alpha2 = acf(2) - alpha3`, `alpha1 = acf(1) - alpha3`, negative values set
+  to `1e-5`; all three are multiplied by `0.6` while
+  `alpha1 + alpha2 + alpha3 > 1`, then `alpha1` and `alpha3` while
+  `2 alpha1 + alpha3 > 1`.
+
+Returns the start vector without the covariate coefficients (order 2 on the
+reparameterized scale of [`reparameterize_alpha`](@ref)) and
+`scale = (1 - sum(alpha)) (1 - eta)`.
 """
-function _innovation_scale(type, order, starting_values, n_parameter_without)
-    eta = type == "GP" ? starting_values[n_parameter_without] : 0.0
-    if Int(order) == 1
-        return (1 - starting_values[1]) * (1 - eta)
+function compute_starting_values_covariate_model(type, order, data)
+    x = Float64.(data)
+    replace_value = 1e-5
+    shrink = 0.6
+    acf = autocor(x, [1, 2])
+    eta = 0.0
+    if type == "GP"
+        eta = 1 - (mean(x) / var(x))^0.5
+        eta < 0 && (eta = replace_value)
+        eta > 1 && (eta = 1 - replace_value)
     end
-    alpha1, alpha2, alpha3 = reparameterize_alpha(starting_values)
-    return (1 - alpha1 - alpha2 - alpha3) * (1 - eta)
+    if Int(order) == 1
+        alpha = acf[1] < 0 ? replace_value : acf[1]
+        base = type == "GP" ? [alpha, eta] : [alpha]
+        return base, (1 - alpha) * (1 - eta)
+    end
+    alpha3 = compute_mu_hat_gmm(x) * (1 - eta)^4 / (mean(x) * (1 + 2 * eta))
+    alpha3 < 0 && (alpha3 = replace_value)
+    alpha2 = acf[2] - alpha3
+    alpha2 < 0 && (alpha2 = replace_value)
+    alpha2 > 1 && (alpha2 = 1 - replace_value)
+    alpha1 = acf[1] - alpha3
+    alpha1 < 0 && (alpha1 = replace_value)
+    while alpha1 + alpha2 + alpha3 > 1
+        alpha1 *= shrink
+        alpha2 *= shrink
+        alpha3 *= shrink
+    end
+    while 2 * alpha1 + alpha3 > 1
+        alpha1 *= shrink
+        alpha3 *= shrink
+    end
+    base = [2 * alpha1 + alpha3, alpha3 / (2 * alpha1 + alpha3),
+        alpha2 / (1 - alpha1 - alpha3)]
+    type == "GP" && push!(base, eta)
+    return base, (1 - alpha1 - alpha2 - alpha3) * (1 - eta)
 end
 
 """
