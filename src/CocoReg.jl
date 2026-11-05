@@ -7,6 +7,33 @@ function _validate_reg_inputs(type, order)
     return Int(order)
 end
 
+"""
+    _check_covariates_full_rank(covariates)
+
+Throws an `ArgumentError` naming the aliased columns if the covariate matrix is
+rank deficient: the regression coefficients are then not identified and the
+GLM starting values are undefined. The rank is that of the column-pivoted QR
+decomposition with relative tolerance `1e-7` (the tolerance of R's `lm`); the
+aliased columns are those pivoted behind the rank. Matrices with non-finite
+entries are left to the later checks.
+"""
+function _check_covariates_full_rank(covariates)
+    X = covariates isa AbstractVector ? reshape(Float64.(covariates), :, 1) :
+        Matrix{Float64}(covariates)
+    k = size(X, 2)
+    (k == 0 || !all(isfinite, X)) && return nothing
+    F = qr(X, ColumnNorm())
+    d = abs.(diag(F.R))
+    r = (isempty(d) || d[1] == 0) ? 0 : count(v -> v > 1e-7 * d[1], d)
+    if r < k
+        aliased = sort(F.p[(r + 1):k])
+        throw(ArgumentError("xreg is rank deficient: column(s) $(join(aliased, ", ")) " *
+                            "are linear combinations of others (rank $r < $k columns); " *
+                            "the model is not identified. Remove the aliased column(s)."))
+    end
+    return nothing
+end
+
 function _n_parameters_without_covariates(type, order)
     Int(order) == 1 ? (type == "GP" ? 2 : 1) : (type == "GP" ? 4 : 3)
 end
@@ -364,6 +391,14 @@ function cocoReg(type, order, data, covariates = nothing, starting_values = noth
         optimizer = nothing; adtype = Optimization.AutoForwardDiff(),
         box_constrained::Bool = false, solve_kwargs...)
     order = _validate_reg_inputs(type, order)
+    # same input checks as coconots::cocoReg: starting values from the lag-order
+    # autocorrelation and at least two transitions; counts up to 170; a full-rank
+    # covariate matrix
+    _check_min_length(length(data), order + 2, "cocoReg",
+        "order-$order model: starting values from the lag-$order autocorrelation, " *
+        "at least two transitions in the likelihood")
+    _check_count_limit(data)
+    isnothing(covariates) || _check_covariates_full_rank(covariates)
     data_int = Int.(data)
 
     starting_values = get_starting_values!(type, order, data_int, covariates,

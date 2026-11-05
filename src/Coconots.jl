@@ -1,6 +1,6 @@
 module Coconots
 
-using LinearAlgebra: diag, inv
+using LinearAlgebra: ColumnNorm, diag, inv, qr
 using Random
 using Statistics: cor, mean, quantile!, var
 using StatsBase: autocor

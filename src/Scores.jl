@@ -122,6 +122,9 @@ function cocoPit(cocoReg_fit, n_bins = 21)
     data = Int.(cocoReg_fit["data"])
     n = length(data)
     order = Int(cocoReg_fit["order"])
+    _check_count_limit(data)
+    _check_min_length(n, order + 1, "cocoPit",
+        "an order-$order model transforms the observations after the first $order")
     eta = _fit_eta(cocoReg_fit)
     lambdas = _fit_lambdas(cocoReg_fit, n)
 
@@ -135,6 +138,7 @@ function cocoPit(cocoReg_fit, n_bins = 21)
         pmf = pmfs === nothing ?
               _transition_pmf(cocoReg_fit, t, data[t], data, lambdas, eta, kernel) :
               pmfs[_history_key(data, t, order)][1:(data[t] + 1)]
+        all(isfinite, pmf) || _throw_nonfinite_pmf("predictive pmf")
         cdf_x = sum(pmf)
         Px[t - order] = cdf_x
         Pxm1[t - order] = cdf_x - pmf[data[t] + 1]
@@ -178,6 +182,10 @@ function compute_scores(cocoReg_fit, max_x = 50)
     data = Int.(cocoReg_fit["data"])
     n = length(data)
     order = Int(cocoReg_fit["order"])
+    _check_support_limit(max_x, "max_x")
+    _check_count_limit(data)
+    _check_min_length(n, order + 1, "compute_scores",
+        "an order-$order model scores the observations after the first $order")
     eta = _fit_eta(cocoReg_fit)
     lambdas = _fit_lambdas(cocoReg_fit, n)
 
@@ -196,6 +204,8 @@ function compute_scores(cocoReg_fit, max_x = 50)
               _transition_pmf(cocoReg_fit, t, max(max_x, x), data, lambdas, eta, kernel) :
               pmfs[_history_key(data, t, order)]
 
+        (isfinite(pmf[x + 1]) && all(isfinite, view(pmf, 1:(max_x + 1)))) ||
+            _throw_nonfinite_pmf("predictive pmf")
         log_term, quad_term, rps = _score_terms(pmf, x, max_x)
         log_score_sum -= log_term
         quad_score_sum += quad_term

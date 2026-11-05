@@ -104,6 +104,7 @@ marginal fit in coconots' `cocoReg_cov.R`.
 """
 function compute_covariate_starting_values(data, covariates, link_function, scale,
         lower_bound)
+    _check_covariates_full_rank(covariates)
     X = Matrix{Float64}(covariates)
     y = Float64.(data)
     if link_function == "log"

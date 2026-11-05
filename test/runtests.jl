@@ -217,3 +217,54 @@ end
     @test Coconots.get_link_function("identity")(2.5) == 2.5
     @test_throws ErrorException Coconots.get_link_function("unknown")
 end
+
+@testset "input validation (counts, short series, covariate rank)" begin
+    # counts above 170 are rejected on both backends
+    big_data = vcat(fill(3, 20), 171, fill(4, 20))
+    @test_throws ArgumentError cocoReg("Poisson", 1, big_data)
+    err = try
+        cocoReg("GP", 2, big_data)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("counts above 170 are not supported", err.msg)
+    @test occursin("observed count = 171", err.msg)
+
+    # too short series
+    @test_throws ArgumentError cocoReg("Poisson", 1, [1, 2])
+    @test_throws ArgumentError cocoReg("GP", 2, [1, 2, 3])
+
+    # rank-deficient covariates
+    n = 60
+    x1 = sin.((1:n) ./ 6)
+    err = try
+        cocoReg("Poisson", 1, fill(2, n), hcat(ones(n), x1, 2 .* x1))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("xreg is rank deficient", err.msg)
+    @test_throws ArgumentError Coconots._check_covariates_full_rank(hcat(x1, zeros(n)))
+    @test Coconots._check_covariates_full_rank(hcat(ones(n), x1)) === nothing
+
+    # assessment tools on a fitted model
+    Random.seed!(31)
+    data = cocoSim("Poisson", 1, [0.3, 1.0], 80)
+    fit = cocoReg("Poisson", 1, data)
+    @test_throws ArgumentError compute_scores(fit, 171)
+    @test_throws ArgumentError cocoPredictOneStep(fit, 0:171)
+    @test_throws ArgumentError cocoBoot(fit, [1:1:80;], 5)
+    bad = copy(fit)
+    bad["data"] = vcat(data[1:(end - 1)], 200)
+    @test_throws ArgumentError compute_scores(bad, 50)
+    @test_throws ArgumentError cocoPit(bad, 10)
+    @test_throws ArgumentError cocoBoot(bad, [1:1:5;], 5)
+    @test_throws ArgumentError cocoPredictOneStep(bad, 0:10)
+    short = copy(fit)
+    short["data"] = data[1:1]
+    @test_throws ArgumentError compute_scores(short, 50)
+    @test_throws ArgumentError cocoPit(short, 10)
+end

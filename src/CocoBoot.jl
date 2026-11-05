@@ -17,6 +17,13 @@ fitted model. Returns a `Dict` with keys `"lower"`, `"upper"`,
 """
 function cocoBoot(cocoReg_fit, lags = [1:1:21;], n_bootstrap = 400, alpha = 0.05,
         n_burn_in = 200, store_matrix = Array{Float64}(undef, length(lags), 2))
+    n = length(cocoReg_fit["data"])
+    _check_count_limit(cocoReg_fit["data"])
+    if !isempty(lags) && maximum(lags) > n - 1
+        throw(ArgumentError("cocoBoot: the largest lag $(maximum(lags)) must be smaller " *
+                            "than the length of the time series ($n); the sample " *
+                            "autocorrelation is defined up to lag $(n - 1)"))
+    end
     pacfs = compute_random_pacfs(cocoReg_fit, lags, Int(n_bootstrap), Int(n_burn_in))
     for i in eachindex(lags)
         store_matrix[i, :] = quantile!(pacfs[:, i], [alpha / 2, 1 - alpha / 2])
@@ -72,6 +79,7 @@ function compute_random_pacfs(cocoReg_fit, lags, n_bootstrap = 400, n_burn_in = 
         Xb = view(X, 1:n_rep, :)
         fill!(Xb, 0)
         _simulate_paths!(Xb, sampler, lambda, n_burn_in)
+        _check_count_limit(Xb, "simulated")
         if joint
             _block_autocor!(pacfs, first_rep - 1, Xb, n_burn_in, n, lag_vector, Z, num,
                 zz)

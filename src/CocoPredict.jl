@@ -23,6 +23,11 @@ function cocoPredictOneStep(cocoReg_fit, x = 0:10, covariates = nothing)
     data = cocoReg_fit["data"]
     xs = collect(Int, x)
     xmax = maximum(xs)
+    order = Int(cocoReg_fit["order"])
+    _check_support_limit(xmax, "x")
+    _check_count_limit(data)
+    _check_min_length(length(data), order, "cocoPredictOneStep",
+        "an order-$order model conditions on the last $order observation(s)")
 
     if Int(cocoReg_fit["order"]) == 2
         eta = cocoReg_fit["type"] == "Poisson" ? 0.0 : parameter[4]
@@ -107,6 +112,9 @@ function cocoPredictKsteps(cocoReg_fit, k, number_simulations = 500,
     parameter = cocoReg_fit["parameter"]
     link = cocoReg_fit["link"]
     data = cocoReg_fit["data"]
+    _check_count_limit(data)
+    _check_min_length(length(data), order, "cocoPredictKsteps",
+        "an order-$order model conditions on the last $order observation(s)")
 
     x_prev = order == 2 ? data[(end - 1):end] : data[end]
 
@@ -114,6 +122,7 @@ function cocoPredictKsteps(cocoReg_fit, k, number_simulations = 500,
         matrix_fill[i, :] = cocoForwardSim(k, x_prev, type, order, parameter,
             covariates, link)
     end
+    _check_count_limit(matrix_fill, "simulated")
 
     return get_relative_frequencies(matrix_fill)
 end

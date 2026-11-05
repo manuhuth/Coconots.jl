@@ -508,6 +508,8 @@ function cocoSim(type, order, parameter, n, covariates = nothing, link = "log",
         X[1, t] = Int(x[t])
     end
     _simulate_paths!(X, sampler, lambda, n_burn_in)
+    # counts above 170 are outside the supported range (as on the RCPP backend)
+    _check_count_limit(X, "simulated")
     for t in 1:n_total
         x[t] = X[1, t]
     end
