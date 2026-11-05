@@ -1,21 +1,89 @@
 export cocoSim
 
-const _MAX_INVERSE_TRANSFORM_ITERATIONS = 1_000_000
+# Termination of the Generalized Poisson inversion (as `GPInvCdf` in the C++
+# backend). In floating point the accumulated cdf F can stay below u forever
+# (its increments round to zero once they fall below half an ulp of F). When
+# the next value F(i) is still < u:
+#  - if the increment vanished (F(i) == F(i - 1)) and 1 - F(i - 1) <=
+#    `_GP_INVERSION_SATURATION_TOL`, F has saturated: beyond the bulk the pmf
+#    decreases, so F keeps this value for all larger i, the remaining mass is at
+#    rounding level, and i is returned;
+#  - if i exceeds `_gp_inversion_upper` (mean + 40 sd + 1000) and either the
+#    increment vanished or F(i - 1) < 1 - `_GP_INVERSION_TAIL_BOUND`, an error is
+#    raised (by Chebyshev's inequality the exact F exceeds 1 - 1/1600 there).
+# Draws are otherwise those of the plain inversion; no extra uniforms are used.
+const _GP_INVERSION_SATURATION_TOL = 1e-8
+const _GP_INVERSION_TAIL_BOUND = 1e-3
+const _GP_INVERSION_MAX = 1_000_000_000
+
+"""
+    _gp_inversion_upper(lambda, eta)
+
+Count beyond which the Generalized Poisson inversion must have (numerically)
+converged: `mean + 40 sd + 1000`, at most `_GP_INVERSION_MAX`.
+"""
+function _gp_inversion_upper(lambda::Real, eta::Real)
+    (isfinite(lambda) && lambda > 0 && eta < 1) || return _GP_INVERSION_MAX
+    a = 1 - Float64(eta)
+    up = ceil(Float64(lambda) / a + 40 * sqrt(Float64(lambda) / a^3)) + 1000
+    return up < _GP_INVERSION_MAX ? Int(up) : _GP_INVERSION_MAX
+end
+
+"""
+    _gp_inversion_stop(i, previous, next, upper, lambda, eta)
+
+Termination rule of the inversion at count `i` with `F(i - 1) = previous` and
+`F(i) = next < u` (see the comment above): `true` if `i` is returned, an error
+if the cdf cannot be evaluated accurately, `false` to continue.
+"""
+@inline function _gp_inversion_stop(i::Int, previous::Real, next::Real, upper::Int,
+        lambda::Real, eta::Real)
+    vanished = !(next > previous)
+    vanished && 1 - previous <= _GP_INVERSION_SATURATION_TOL && return true
+    if i > upper && (vanished || previous < 1 - _GP_INVERSION_TAIL_BOUND)
+        error("Generalized Poisson inversion did not converge: the cumulative " *
+              "probability stays at $(previous) < 1 (lambda = $(lambda), eta = $(eta))")
+    end
+    return false
+end
 
 """
     draw_random_generalized_poisson_variable(u, lambda, eta)
 
 Draws from the Generalized Poisson distribution by inverse-transform sampling
-of the uniform variate `u`.
+of the uniform variate `u` (smallest `i` with `F(i) >= u`; see
+`_gp_inversion_stop` for the termination when `F` saturates below `u`).
 """
 function draw_random_generalized_poisson_variable(u::Real, lambda::Real, eta::Real)
     cumulative = generalized_poisson_distribution(0, lambda, eta)
+    upper = _gp_inversion_upper(lambda, eta)
     i = 0
-    while cumulative < u && i < _MAX_INVERSE_TRANSFORM_ITERATIONS
+    while cumulative < u
         i += 1
-        cumulative += generalized_poisson_distribution(i, lambda, eta)
+        next = cumulative + generalized_poisson_distribution(i, lambda, eta)
+        if next < u && _gp_inversion_stop(i, cumulative, next, upper, lambda, eta)
+            return i
+        end
+        cumulative = next
     end
     return i
+end
+
+"""
+    _check_simulation_rates(lambda)
+
+Simulation needs a finite, positive innovation rate `lambda_t = link(x_t' beta)`
+for every `t` (the identity link gives `lambda_t <= 0` for `x_t' beta <= 0`).
+"""
+function _check_simulation_rates(lambda)
+    for (t, l) in enumerate(lambda)
+        if !(isfinite(l) && l > 0)
+            error("The innovation mean lambda_t = link(x_t' beta) must be finite " *
+                  "and positive for every t, but lambda_t = $(l) at t = $(t). With " *
+                  "the identity link choose covariates and beta such that x_t' beta > 0.")
+        end
+    end
+    return nothing
 end
 
 """
@@ -163,6 +231,8 @@ mutable struct _TransitionSampler
     gbuf::Vector{Float64}
     hbuf::Vector{Float64}
     scratch::Vector{Float64}
+    # _gp_inversion_upper(lambda, eta) of the current rate
+    innovation_upper::Int
 end
 
 function _TransitionSampler(order::Int, alpha::Float64, alpha1::Float64, alpha2::Float64,
@@ -172,7 +242,7 @@ function _TransitionSampler(order::Int, alpha::Float64, alpha1::Float64, alpha2:
         Float64[], zeros(Int, 0, 0), zeros(Int, 0, 0), 1, Float64[],
         (Float64[], Float64[], Float64[], Float64[], Float64[]), nothing, -1,
         Float64[], -1, -1, Float64[], Int[], Int[], Float64[], Float64[], Float64[],
-        Float64[])
+        Float64[], 0)
 end
 
 """
@@ -184,6 +254,7 @@ when the rate changes.
 function _set_rate!(s::_TransitionSampler, lambda::Float64)
     lambda == s.lambda && return s
     s.lambda = lambda
+    s.innovation_upper = _gp_inversion_upper(lambda, s.eta)
     empty!(s.innovation_cdf)
     s.stamp += 1
     empty!(s.g_store)
@@ -209,20 +280,24 @@ end
     _draw_innovation!(sampler, u)
 
 Same draw as [`draw_random_generalized_poisson_variable`](@ref) at the
-sampler's rate, from a lazily extended cumulative table.
+sampler's rate (including its termination rule), from a lazily extended
+cumulative table.
 """
 function _draw_innovation!(s::_TransitionSampler, u::Float64)
-    upper = _MAX_INVERSE_TRANSFORM_ITERATIONS
+    cdf = s.innovation_cdf
     i = 0
-    while i < upper
-        if i >= length(s.innovation_cdf)
-            _extend_innovation_cdf!(s,
-                min(upper, max(32, 2 * length(s.innovation_cdf))))
+    while true
+        if i >= length(cdf)
+            _extend_innovation_cdf!(s, max(32, 2 * length(cdf)))
         end
-        @inbounds s.innovation_cdf[i + 1] < u || return i
+        @inbounds c = cdf[i + 1]
+        c < u || return i
+        if i > 0 && _gp_inversion_stop(i, @inbounds(cdf[i]), c, s.innovation_upper,
+            s.lambda, s.eta)
+            return i
+        end
         i += 1
     end
-    return upper
 end
 
 """
@@ -407,9 +482,11 @@ function _simulation_setup(type, order::Int, parameter, n::Int, covariates, link
         link_function = get_link_function(link)
         n_betas = size(covariates, 2)
         lambda_data = link_function.(covariates * parameter[(end - n_betas + 1):end])
+        _check_simulation_rates(lambda_data)
         lambda = Float64.(repeat(lambda_data,
             Int(ceil(1 + n_burn_in / n)))[(end - n_total + 1):end])
     else
+        _check_simulation_rates(last(parameter))
         lambda = fill(Float64(last(parameter)), n_total)
     end
 

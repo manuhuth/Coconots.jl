@@ -217,3 +217,4 @@ end
     @test Coconots.get_link_function("identity")(2.5) == 2.5
     @test_throws ErrorException Coconots.get_link_function("unknown")
 end
+include("simulation.jl")
