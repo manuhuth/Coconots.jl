@@ -78,7 +78,10 @@ end
             x=zeros(Int(n + n_burn_in)))
 
 Simulates a count time series of length `n` from a (Generalized) Poisson
-autoregressive model, discarding `n_burn_in` initial observations. Parameter
+autoregressive model, discarding `n_burn_in` initial observations. With
+covariates, observation `t` of the output uses covariate row `t` (the burn-in
+cycles through the rows). With `n_burn_in = 0` the first `order` observations
+are drawn from the innovation distribution at their covariate rows. Parameter
 layout: `alpha[, eta], lambda` for order 1 and
 `alpha1, alpha2, alpha3[, eta], lambda` for order 2; with covariates the
 trailing `lambda` is replaced by the regression coefficients.
@@ -109,8 +112,23 @@ function cocoSim(type, order, parameter, n, covariates = nothing, link = "log",
         eta = type == "GP" ? parameter[2] : zero(eltype(lambda))
     end
 
-    for t in 3:n_total
-        x[t] = draw_random_g(order, rand(), Int(x[t - 1]), Int(x[t - 2]), lambda[t],
+    # With a burn-in of at least two steps the start values x[1:2] are discarded.
+    # Otherwise they are part of the output: they are then drawn from the
+    # innovation distribution at lambda_1, ..., lambda_order (the RCPP convention
+    # for simulations without burn-in, e.g. with covariates) instead of being
+    # returned as zeros, and the recursion starts at t = order + 1.
+    if n_burn_in < 2
+        for t in 1:min(order, n_total)
+            x[t] = draw_random_generalized_poisson_variable(rand(), lambda[t], eta)
+        end
+        t_first = order + 1
+    else
+        t_first = 3
+    end
+
+    for t in t_first:n_total
+        z = t > 2 ? Int(x[t - 2]) : 0
+        x[t] = draw_random_g(order, rand(), Int(x[t - 1]), z, lambda[t],
             alpha1, alpha2, alpha3, alpha, eta, nothing) +
                draw_random_generalized_poisson_variable(rand(), lambda[t], eta)
     end
