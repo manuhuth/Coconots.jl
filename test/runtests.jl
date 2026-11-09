@@ -12,7 +12,7 @@ using JET
 end
 
 @testset "JET" begin
-    JET.test_package(Coconots; target_defined_modules = true)
+    JET.test_package(Coconots; target_modules = (Coconots,))
 end
 
 @testset "convolution distributions (order 1)" begin

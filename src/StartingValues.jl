@@ -45,7 +45,7 @@ reparameterized scale of [`reparameterize_alpha`](@ref)) and
 `scale = (1 - sum(alpha)) (1 - eta)`.
 """
 function compute_starting_values_covariate_model(type, order, data)
-    x = Float64.(data)
+    x = Vector{Float64}(data)::Vector{Float64}
     replace_value = 1e-5
     shrink = 0.6
     acf = autocor(x, [1, 2])
@@ -200,7 +200,7 @@ Returned on the reparameterized scale in Julia ordering (lambda last):
 alpha2 / (1 - alpha1 - alpha3)[, eta], lambda]`.
 """
 function compute_starting_values_GP2_reparameterized(type, data)
-    x = Float64.(data)
+    x = Vector{Float64}(data)::Vector{Float64}
     replace_value = 1e-5
     shrink = type == "GP" ? 0.99 : 0.6
     acf = autocor(x, [1, 2])
